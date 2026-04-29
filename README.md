@@ -1,6 +1,10 @@
 # stamp-hole
 郵票打洞瑕疵檢測
 
+## 套件
+僅依賴opencv，詳如pyproject.toml
+直接環境建置即可
+
 ## 環境建置
 ```bash
  uv venv
