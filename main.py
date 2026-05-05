@@ -47,6 +47,8 @@ def preprocess_image(
     threshold_mode="global",
     adaptive_block_size=31,
     adaptive_c=5,
+    tophat_kernel=21,
+    tophat_percentile=98.0,
 ):
     img = cv2.imread(image_path)
     if img is None:
@@ -70,6 +72,26 @@ def preprocess_image(
         )
         # Suppress single-pixel speckle from adaptive threshold without
         # eroding genuine 6-px holes.
+        open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
+    elif threshold_mode == "tophat":
+        # Black top-hat = morphological closing - input. Closing fills
+        # dark holes with bright (because elliptical kernel > hole_dia
+        # bridges across them); subtracting input leaves a positive
+        # response only where holes used to be. Unlike adaptive
+        # thresholding on the contrast-boosted gray, blackhat is
+        # naturally selective: large bright/dark regions of the stamp
+        # body cancel out, so only sub-kernel-sized dark structures
+        # survive. Threshold by intensity percentile so the cut adapts
+        # per-image instead of relying on a hard-coded value.
+        raw_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        kernel_size = max(5, int(tophat_kernel))
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        blackhat = cv2.morphologyEx(raw_gray, cv2.MORPH_BLACKHAT, kernel)
+        threshold_value = int(np.percentile(blackhat, float(tophat_percentile)))
+        _, mask = cv2.threshold(blackhat, max(threshold_value, 1), 255, cv2.THRESH_BINARY)
         open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
     else:
@@ -2126,6 +2148,8 @@ def analyze_curve_mode(
     threshold_mode="global",
     adaptive_block_size=31,
     adaptive_c=5,
+    tophat_kernel=21,
+    tophat_percentile=98.0,
     metrics_baseline=None,
     scorer="area",
     grid_prior_mode="off",
@@ -2135,6 +2159,8 @@ def analyze_curve_mode(
         threshold_mode=threshold_mode,
         adaptive_block_size=adaptive_block_size,
         adaptive_c=adaptive_c,
+        tophat_kernel=tophat_kernel,
+        tophat_percentile=tophat_percentile,
     )
     holes = detect_hole_centers(mask)
     points = hole_points(holes)
@@ -2219,6 +2245,8 @@ def analyze_curve_mode(
 
     if threshold_mode == "adaptive":
         write_debug_image(debug_path / "adaptive_mask.jpg", mask)
+    elif threshold_mode == "tophat":
+        write_debug_image(debug_path / "tophat_mask.jpg", mask)
 
     secondary_origin_row_curve_mask = build_curve_band_mask(
         mask.shape,
@@ -2530,8 +2558,12 @@ def analyze_curve_mode(
 
     if threshold_mode != "global":
         metrics["threshold_mode"] = threshold_mode
-        metrics["adaptive_block_size"] = adaptive_block_size
-        metrics["adaptive_c"] = adaptive_c
+        if threshold_mode == "adaptive":
+            metrics["adaptive_block_size"] = adaptive_block_size
+            metrics["adaptive_c"] = adaptive_c
+        elif threshold_mode == "tophat":
+            metrics["tophat_kernel"] = tophat_kernel
+            metrics["tophat_percentile"] = tophat_percentile
 
     if scorer != "area":
         metrics["scorer"] = scorer
@@ -2577,12 +2609,16 @@ def detect_and_link_limited_holes(
     threshold_mode="global",
     adaptive_block_size=31,
     adaptive_c=5,
+    tophat_kernel=21,
+    tophat_percentile=98.0,
 ):
     img, gray, mask = preprocess_image(
         image_path,
         threshold_mode=threshold_mode,
         adaptive_block_size=adaptive_block_size,
         adaptive_c=adaptive_c,
+        tophat_kernel=tophat_kernel,
+        tophat_percentile=tophat_percentile,
     )
     display_img = img.copy()
     bw_display_img = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
@@ -2676,9 +2712,13 @@ def parse_args():
     parser.add_argument("--secondary_origin_blackhat_percentile", type=float, default=None)
     parser.add_argument("--secondary_origin_curve_extend_pixels", type=int, default=0)
     parser.add_argument("--paper_mask", choices=["on", "off"], default="off")
-    parser.add_argument("--threshold_mode", choices=["global", "adaptive"], default="global")
+    parser.add_argument("--threshold_mode", choices=["global", "adaptive", "tophat"], default="global")
     parser.add_argument("--adaptive_block_size", type=int, default=31)
     parser.add_argument("--adaptive_c", type=int, default=5)
+    parser.add_argument("--tophat_kernel", type=int, default=21,
+                        help="Elliptical kernel size for black top-hat (forced odd)")
+    parser.add_argument("--tophat_percentile", type=float, default=98.0,
+                        help="Percentile of blackhat response used as threshold")
     parser.add_argument("--metrics_baseline", type=str, default=None,
                         help="Path to baseline curve_metrics.json for regression diff")
     parser.add_argument("--scorer", choices=["area", "template"], default="area",
@@ -2715,6 +2755,8 @@ if __name__ == "__main__":
             threshold_mode=args.threshold_mode,
             adaptive_block_size=args.adaptive_block_size,
             adaptive_c=args.adaptive_c,
+            tophat_kernel=args.tophat_kernel,
+            tophat_percentile=args.tophat_percentile,
             metrics_baseline=args.metrics_baseline,
             scorer=args.scorer,
             grid_prior_mode=args.grid_prior,
@@ -2729,4 +2771,6 @@ if __name__ == "__main__":
             threshold_mode=args.threshold_mode,
             adaptive_block_size=args.adaptive_block_size,
             adaptive_c=args.adaptive_c,
+            tophat_kernel=args.tophat_kernel,
+            tophat_percentile=args.tophat_percentile,
         )
