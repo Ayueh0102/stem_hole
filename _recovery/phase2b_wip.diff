@@ -1,0 +1,87 @@
+45c45,50
+< def preprocess_image(image_path):
+---
+> def preprocess_image(
+>     image_path,
+>     threshold_mode="global",
+>     adaptive_block_size=31,
+>     adaptive_c=5,
+> ):
+52c57,77
+<     _, mask = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY_INV)
+---
+> 
+>     if threshold_mode == "adaptive":
+>         # adaptiveThreshold's blockSize must be odd
+>         block = int(adaptive_block_size)
+>         if block % 2 == 0:
+>             block += 1
+>         mask = cv2.adaptiveThreshold(
+>             gray,
+>             255,
+>             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+>             cv2.THRESH_BINARY_INV,
+>             block,
+>             int(adaptive_c),
+>         )
+>         # Suppress single-pixel speckle from adaptive threshold without
+>         # eroding genuine 6-px holes.
+>         open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+>         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
+>     else:
+>         _, mask = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY_INV)
+> 
+1698a1724,1726
+>     threshold_mode="global",
+>     adaptive_block_size=31,
+>     adaptive_c=5,
+1700c1728,1733
+<     img, gray, mask = preprocess_image(image_path)
+---
+>     img, gray, mask = preprocess_image(
+>         image_path,
+>         threshold_mode=threshold_mode,
+>         adaptive_block_size=adaptive_block_size,
+>         adaptive_c=adaptive_c,
+>     )
+1763a1797,1799
+>     if threshold_mode == "adaptive":
+>         write_debug_image(debug_path / "adaptive_mask.jpg", mask)
+> 
+2040a2077,2081
+>     if threshold_mode != "global":
+>         metrics["threshold_mode"] = threshold_mode
+>         metrics["adaptive_block_size"] = adaptive_block_size
+>         metrics["adaptive_c"] = adaptive_c
+> 
+2058,2059c2099,2113
+< def detect_and_link_limited_holes(image_path, output_path, dist_threshold=32, offset_threshold=3.0):
+<     img, gray, mask = preprocess_image(image_path)
+---
+> def detect_and_link_limited_holes(
+>     image_path,
+>     output_path,
+>     dist_threshold=32,
+>     offset_threshold=3.0,
+>     threshold_mode="global",
+>     adaptive_block_size=31,
+>     adaptive_c=5,
+> ):
+>     img, gray, mask = preprocess_image(
+>         image_path,
+>         threshold_mode=threshold_mode,
+>         adaptive_block_size=adaptive_block_size,
+>         adaptive_c=adaptive_c,
+>     )
+2151a2206,2208
+>     parser.add_argument("--threshold_mode", choices=["global", "adaptive"], default="global")
+>     parser.add_argument("--adaptive_block_size", type=int, default=31)
+>     parser.add_argument("--adaptive_c", type=int, default=5)
+2178a2236,2238
+>             threshold_mode=args.threshold_mode,
+>             adaptive_block_size=args.adaptive_block_size,
+>             adaptive_c=args.adaptive_c,
+2186a2247,2249
+>             threshold_mode=args.threshold_mode,
+>             adaptive_block_size=args.adaptive_block_size,
+>             adaptive_c=args.adaptive_c,

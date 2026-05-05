@@ -1,11 +1,15 @@
 import argparse
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
 import numpy as np
+
+
+# MAD-to-sigma consistency factor for normally-distributed residuals.
+MAD_TO_SIGMA = 1.4826
 
 
 @dataclass
@@ -32,6 +36,10 @@ class CurveModel:
     median_residual: float
     mad_residual: float
     offset_threshold: float
+    derivative_coeffs: np.ndarray = field(init=False)
+
+    def __post_init__(self):
+        self.derivative_coeffs = np.polyder(self.coeffs)
 
 
 def preprocess_image(image_path):
@@ -43,6 +51,54 @@ def preprocess_image(image_path):
     gray = cv2.cvtColor(contrast_img, cv2.COLOR_BGR2GRAY)
     _, mask = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY_INV)
     return img, gray, mask
+
+
+def segment_paper_region(image, points, padding_pixels=40):
+    """Estimate the stamp-sheet area as the dilated convex hull of
+    detected hole centres.
+
+    Intensity-based segmentation (Otsu on blurred grayscale) is brittle
+    here because the stamp sheet contains a mix of dark ink, paper-colour
+    holes, and a thin printed frame line; both the hole grid and the
+    scanner backing can produce confusing thresholds. The detected hole
+    centres are already a strong signal: they trace the perforation grid,
+    which by definition sits inside the sheet. The convex hull of those
+    centres bounds the hole grid; padding outward by half-a-pitch worth
+    of pixels gives a generous boundary that still excludes the scanner
+    background and any printed marks outside the perforated area.
+
+    Returns a uint8 mask (255 inside paper, 0 outside). When too few
+    points are available to form a hull, returns a fully-True mask so the
+    caller can treat ``paper_mask`` as a no-op.
+    """
+    height, width = image.shape[:2]
+    if len(points) < 3:
+        return np.full((height, width), 255, dtype=np.uint8)
+
+    pts = np.array(points, dtype=np.int32).reshape(-1, 1, 2)
+    hull = cv2.convexHull(pts)
+
+    mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillConvexPoly(mask, hull, 255)
+
+    if padding_pixels > 0:
+        kernel_size = max(3, padding_pixels * 2 + 1)
+        dilate_struct = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        mask = cv2.dilate(mask, dilate_struct)
+
+    return mask
+
+
+def is_inside_paper(paper_mask, x, y):
+    """Return True if (x, y) is inside the paper region (or paper_mask is None)."""
+    if paper_mask is None:
+        return True
+    height, width = paper_mask.shape[:2]
+    ix = int(round(float(x)))
+    iy = int(round(float(y)))
+    if ix < 0 or iy < 0 or ix >= width or iy >= height:
+        return False
+    return bool(paper_mask[iy, ix])
 
 
 def detect_hole_centers(mask, min_diameter=6, max_diameter=16, min_circularity=0.45):
@@ -112,27 +168,37 @@ def compute_hole_statistics(holes):
 
 
 def build_candidate_edges(points, min_dist=15, max_dist=32):
-    edges = []
     num_points = len(points)
-    for i in range(num_points):
-        p1 = points[i]
-        for j in range(i + 1, num_points):
-            p2 = points[j]
-            dx = p2[0] - p1[0]
-            dy = p2[1] - p1[1]
-            dist = float(np.hypot(dx, dy))
-            if min_dist <= dist <= max_dist:
-                angle = float(np.degrees(np.arctan2(dy, dx)) % 180)
-                edges.append(
-                    {
-                        "points": (i, j),
-                        "distance": dist,
-                        "dx": dx,
-                        "dy": dy,
-                        "angle": angle,
-                    }
-                )
+    if num_points < 2:
+        return []
 
+    pts = np.asarray(points, dtype=float)
+    i_arr, j_arr = np.triu_indices(num_points, k=1)
+    dx_arr = pts[j_arr, 0] - pts[i_arr, 0]
+    dy_arr = pts[j_arr, 1] - pts[i_arr, 1]
+    dist_arr = np.hypot(dx_arr, dy_arr)
+    sel = (dist_arr >= min_dist) & (dist_arr <= max_dist)
+
+    if not np.any(sel):
+        return []
+
+    i_sel = i_arr[sel]
+    j_sel = j_arr[sel]
+    dx_sel = dx_arr[sel]
+    dy_sel = dy_arr[sel]
+    dist_sel = dist_arr[sel]
+    angle_sel = np.degrees(np.arctan2(dy_sel, dx_sel)) % 180
+
+    edges = [
+        {
+            "points": (int(i_sel[k]), int(j_sel[k])),
+            "distance": float(dist_sel[k]),
+            "dx": int(dx_sel[k]),
+            "dy": int(dy_sel[k]),
+            "angle": float(angle_sel[k]),
+        }
+        for k in range(len(i_sel))
+    ]
     edges.sort(key=lambda x: x["distance"])
     return edges
 
@@ -365,7 +431,7 @@ def robust_polyfit(parameter_values, target_values, degree=2, residual_threshold
     residuals = np.abs(target_values - np.polyval(best_coeffs, parameter_values))
     median_residual = float(np.median(residuals))
     mad_residual = float(np.median(np.abs(residuals - median_residual)))
-    scaled_mad = 1.4826 * mad_residual
+    scaled_mad = MAD_TO_SIGMA * mad_residual
     offset_threshold = max(3.0, median_residual + 3.0 * max(scaled_mad, 0.5))
 
     return best_coeffs, best_inliers, residuals, median_residual, mad_residual, offset_threshold
@@ -426,7 +492,7 @@ def sample_curve_points(model, samples=300, image_shape=None, extend_pixels=0):
         sample_start = core_start - float(extend_pixels)
         sample_end = core_end + float(extend_pixels)
 
-    derivative_coeffs = np.polyder(model.coeffs)
+    derivative_coeffs = model.derivative_coeffs
     start_target = float(np.polyval(model.coeffs, core_start))
     end_target = float(np.polyval(model.coeffs, core_end))
     start_slope = float(np.polyval(derivative_coeffs, core_start))
@@ -548,7 +614,7 @@ def evaluate_curve_point(model, parameter):
     parameter = float(parameter)
     core_start = model.parameter_min
     core_end = model.parameter_max
-    derivative_coeffs = np.polyder(model.coeffs)
+    derivative_coeffs = model.derivative_coeffs
 
     if parameter < core_start:
         start_target = float(np.polyval(model.coeffs, core_start))
@@ -651,7 +717,17 @@ def estimate_spacing_lattice(points, model, min_pitch=10.0, max_pitch=40.0):
         "lattice_residual_max": float(np.max(residuals)),
     }
 
-def score_expected_hole_roi(mask, center, expected_area, expected_radius, roi_radius):
+def score_expected_hole_roi(
+    mask,
+    center,
+    expected_area,
+    expected_radius,
+    roi_radius,
+    weak_area_ratio=0.55,
+    weak_template_overlap=0.35,
+    broken_area_ratio=0.20,
+    broken_template_overlap=0.16,
+):
     height, width = mask.shape[:2]
     x, y = center
     x1 = max(0, int(round(x - roi_radius)))
@@ -721,9 +797,9 @@ def score_expected_hole_roi(mask, center, expected_area, expected_radius, roi_ra
     centered = centroid_shift is not None and centroid_shift <= expected_radius * 0.9
     loosely_centered = centroid_shift is not None and centroid_shift <= expected_radius * 1.35
 
-    if area_ratio >= 0.55 and template_overlap >= 0.35 and centered:
+    if area_ratio >= weak_area_ratio and template_overlap >= weak_template_overlap and centered:
         candidate_class = "WEAK"
-    elif (area_ratio >= 0.20 or template_overlap >= 0.16) and loosely_centered:
+    elif (area_ratio >= broken_area_ratio or template_overlap >= broken_template_overlap) and loosely_centered:
         candidate_class = "BROKEN"
     else:
         candidate_class = "MISSING"
@@ -745,6 +821,38 @@ def score_expected_hole_roi(mask, center, expected_area, expected_radius, roi_ra
         "component_roi_span_y": component_roi_span_y,
         "component_fill_ratio": component_fill_ratio,
     }
+
+
+def evaluate_candidate_position(
+    mask,
+    x,
+    y,
+    accepted_points,
+    match_radius,
+    expected_area,
+    expected_radius,
+    roi_radius,
+):
+    """Run the shared NN-rejection + ROI scoring for a candidate position.
+
+    Returns ``(score | None, nearest_distance)``. ``score`` is ``None`` if the
+    candidate falls within ``match_radius`` of any accepted point or if
+    ``score_expected_hole_roi`` rejects the ROI. Callers stay responsible for
+    bounds checks, secondary gates (e.g. curve-mask, frame-line filters),
+    and final dict construction so JSON key order is preserved per site.
+    """
+    distances = np.hypot(accepted_points[:, 0] - x, accepted_points[:, 1] - y)
+    nearest_distance = float(np.min(distances))
+    if nearest_distance <= match_radius:
+        return None, nearest_distance
+    score = score_expected_hole_roi(
+        mask,
+        (x, y),
+        expected_area=expected_area,
+        expected_radius=expected_radius,
+        roi_radius=roi_radius,
+    )
+    return score, nearest_distance
 
 
 def is_frame_line_like_score(
@@ -783,44 +891,53 @@ def is_frame_line_like_score(
     return line_like or block_like
 
 
-def deduplicate_candidates(candidates, merge_radius):
+def _default_merge_source(candidate):
+    return {
+        "orientation": candidate["orientation"],
+        "line_id": candidate["line_id"],
+        "parameter": candidate["parameter"],
+    }
+
+
+def deduplicate_candidates(
+    candidates,
+    merge_radius,
+    *,
+    sources_key="merged_sources",
+    source_extractor=_default_merge_source,
+    sort_extras=None,
+):
     class_rank = {"WEAK": 3, "BROKEN": 2, "MISSING": 1}
-    candidates = sorted(
-        candidates,
-        key=lambda item: (
+
+    def sort_key(item):
+        base = (
             class_rank.get(item["class"], 0),
             item["area_ratio"],
             item["template_overlap"],
-        ),
-        reverse=True,
-    )
+        )
+        if sort_extras is None:
+            return base
+        return base + tuple(sort_extras(item))
+
+    sorted_candidates = sorted(candidates, key=sort_key, reverse=True)
 
     kept = []
-    for candidate in candidates:
+    for candidate in sorted_candidates:
         center = np.array(candidate["center"], dtype=float)
-        is_duplicate = False
+        duplicate = None
         for kept_candidate in kept:
             kept_center = np.array(kept_candidate["center"], dtype=float)
             if np.linalg.norm(center - kept_center) <= merge_radius:
-                kept_candidate.setdefault("merged_sources", []).append(
-                    {
-                        "orientation": candidate["orientation"],
-                        "line_id": candidate["line_id"],
-                        "parameter": candidate["parameter"],
-                    }
-                )
-                is_duplicate = True
+                duplicate = kept_candidate
                 break
 
-        if not is_duplicate:
-            candidate["merged_sources"] = [
-                {
-                    "orientation": candidate["orientation"],
-                    "line_id": candidate["line_id"],
-                    "parameter": candidate["parameter"],
-                }
-            ]
-            kept.append(candidate)
+        source = source_extractor(candidate)
+        if duplicate is None:
+            new_kept = dict(candidate)
+            new_kept[sources_key] = [source]
+            kept.append(new_kept)
+        else:
+            duplicate[sources_key].append(source)
 
     return kept
 
@@ -834,6 +951,7 @@ def find_expected_hole_candidates(
     match_radius=8.0,
     roi_radius=14,
     gap_factor=1.55,
+    paper_mask=None,
 ):
     if not points or not models:
         return []
@@ -892,18 +1010,12 @@ def find_expected_hole_candidates(
             x, y = evaluate_curve_point(model, parameter)
             if x < 0 or y < 0 or x >= width or y >= height:
                 continue
-
-            distances = np.hypot(accepted_points[:, 0] - x, accepted_points[:, 1] - y)
-            nearest_distance = float(np.min(distances))
-            if nearest_distance <= match_radius:
+            if not is_inside_paper(paper_mask, x, y):
                 continue
 
-            score = score_expected_hole_roi(
-                mask,
-                (x, y),
-                expected_area=expected_area,
-                expected_radius=expected_radius,
-                roi_radius=roi_radius,
+            score, nearest_distance = evaluate_candidate_position(
+                mask, x, y, accepted_points, match_radius,
+                expected_area, expected_radius, roi_radius,
             )
             if score is None:
                 continue
@@ -930,6 +1042,7 @@ def find_spacing_inferred_hole_candidates(
     hole_stats,
     match_radius=8.0,
     roi_radius=14,
+    paper_mask=None,
 ):
     if not points or not models:
         return [], []
@@ -961,18 +1074,12 @@ def find_spacing_inferred_hole_candidates(
             x, y = evaluate_curve_point(model, parameter)
             if x < 0 or y < 0 or x >= width or y >= height:
                 continue
-
-            distances = np.hypot(accepted_points[:, 0] - x, accepted_points[:, 1] - y)
-            nearest_distance = float(np.min(distances))
-            if nearest_distance <= match_radius:
+            if not is_inside_paper(paper_mask, x, y):
                 continue
 
-            score = score_expected_hole_roi(
-                mask,
-                (x, y),
-                expected_area=expected_area,
-                expected_radius=expected_radius,
-                roi_radius=roi_radius,
+            score, nearest_distance = evaluate_candidate_position(
+                mask, x, y, accepted_points, match_radius,
+                expected_area, expected_radius, roi_radius,
             )
             if score is None:
                 continue
@@ -1004,6 +1111,7 @@ def find_local_gap_candidates(
     integer_tolerance=0.35,
     max_slot_span=4,
     endpoint_extend_steps=2,
+    paper_mask=None,
 ):
     if not points or not models:
         return [], []
@@ -1029,35 +1137,27 @@ def find_local_gap_candidates(
             ),
             key=lambda item: item[0],
         )
+        candidates_before_model = len(candidates)
         gap_count = 0
-        candidate_count = 0
         def append_candidate(parameter, source, extra_fields, require_evidence=False):
-            nonlocal candidate_count
             x, y = evaluate_curve_point(model, parameter)
             if x < 0 or y < 0 or x >= width or y >= height:
                 return False, True
+            if not is_inside_paper(paper_mask, x, y):
+                return False, True
 
-            distances = np.hypot(accepted_points[:, 0] - x, accepted_points[:, 1] - y)
-            nearest_distance = float(np.min(distances))
-            if nearest_distance <= match_radius:
-                return False, False
-
-            score = score_expected_hole_roi(
-                mask,
-                (x, y),
-                expected_area=expected_area,
-                expected_radius=expected_radius,
-                roi_radius=roi_radius,
+            score, nearest_distance = evaluate_candidate_position(
+                mask, x, y, accepted_points, match_radius,
+                expected_area, expected_radius, roi_radius,
             )
             if score is None:
-                return False, True
+                return False, nearest_distance > match_radius
 
             if require_evidence and score["class"] == "MISSING":
                 return False, True
             if require_evidence and is_frame_line_like_score(score):
                 return False, True
 
-            candidate_count += 1
             candidates.append(
                 {
                     "center": [float(x), float(y)],
@@ -1108,7 +1208,7 @@ def find_local_gap_candidates(
                         "right_center": [int(points[right_idx][0]), int(points[right_idx][1])],
                     },
                 )
-        endpoint_count_before = candidate_count
+        endpoint_count_before = len(candidates) - candidates_before_model
         if endpoint_extend_steps > 0 and len(ordered) >= 2:
             endpoints = [
                 ("start", ordered[0], -1),
@@ -1137,6 +1237,7 @@ def find_local_gap_candidates(
                     )
                     if should_stop or not added:
                         break
+        candidate_count = len(candidates) - candidates_before_model
         endpoint_candidate_count = candidate_count - endpoint_count_before
 
         line_summaries.append(
@@ -1180,6 +1281,7 @@ def merge_row_col_consensus_candidates(
     consensus_radius=8.0,
     match_radius=8.0,
     roi_radius=14,
+    paper_mask=None,
 ):
     if not row_candidates and not col_candidates:
         return [], []
@@ -1211,17 +1313,11 @@ def merge_row_col_consensus_candidates(
         row_center = np.array(row_candidate["center"], dtype=float)
         col_center = np.array(col_candidate["center"], dtype=float)
         center = (row_center + col_center) / 2.0
-        distances = np.hypot(accepted_points[:, 0] - center[0], accepted_points[:, 1] - center[1])
-        nearest_distance = float(np.min(distances))
-        if nearest_distance <= match_radius:
+        if not is_inside_paper(paper_mask, center[0], center[1]):
             continue
-
-        score = score_expected_hole_roi(
-            mask,
-            (center[0], center[1]),
-            expected_area=expected_area,
-            expected_radius=expected_radius,
-            roi_radius=roi_radius,
+        score, nearest_distance = evaluate_candidate_position(
+            mask, center[0], center[1], accepted_points, match_radius,
+            expected_area, expected_radius, roi_radius,
         )
         if score is None:
             continue
@@ -1431,6 +1527,71 @@ def write_candidate_crops(mask, candidates, output_path, crop_radius=28, max_cro
     contact_sheet = np.vstack(padded_rows)
     write_debug_image(output_path, contact_sheet, small_max_side=1600)
 
+
+STRATEGY_ARTIFACT_PATHS = {
+    "expected_hole": {
+        "overlay": "expected_hole_candidates_overlay.jpg",
+        "crops": "expected_hole_candidate_crops.jpg",
+        "repaired_overlay": "repaired_circles_overlay.jpg",
+        "repaired_mask": "repaired_circles_mask.jpg",
+        "json": "expected_hole_candidates.json",
+    },
+    "spacing_inferred": {
+        "overlay": "spacing_inferred_circles_overlay.jpg",
+        "crops": "spacing_inferred_circle_crops.jpg",
+        "repaired_overlay": "spacing_repaired_circles_overlay.jpg",
+        "repaired_mask": "spacing_repaired_circles_mask.jpg",
+        "json": "spacing_inferred_circles.json",
+    },
+    "local_gap": {
+        "overlay": "local_gap_candidates_overlay.jpg",
+        "crops": "local_gap_candidate_crops.jpg",
+        "repaired_overlay": "local_gap_repaired_circles_overlay.jpg",
+        "repaired_mask": "local_gap_repaired_circles_mask.jpg",
+        "json": "local_gap_candidates.json",
+    },
+    "consensus": {
+        "overlay": "row_col_consensus_overlay.jpg",
+        "crops": "row_col_consensus_candidate_crops.jpg",
+        "repaired_overlay": "consensus_repaired_circles_overlay.jpg",
+        "repaired_mask": "consensus_repaired_circles_mask.jpg",
+        "json": "row_col_consensus_candidates.json",
+    },
+    "secondary_origin": {
+        "overlay": "secondary_origin_candidates_overlay.jpg",
+        "crops": "secondary_origin_candidate_crops.jpg",
+        "repaired_overlay": "secondary_origin_repaired_circles_overlay.jpg",
+        "repaired_mask": "secondary_origin_repaired_circles_mask.jpg",
+        "json": "secondary_origin_candidates.json",
+    },
+}
+
+
+def emit_strategy_artifacts(
+    name,
+    mask,
+    holes,
+    points,
+    candidates,
+    expected_radius,
+    debug_path,
+    json_payload,
+    overlay_image=None,
+):
+    cfg = STRATEGY_ARTIFACT_PATHS[name]
+    if overlay_image is None:
+        overlay_image = draw_expected_hole_candidates(mask, points, candidates)
+    write_debug_image(debug_path / cfg["overlay"], overlay_image)
+    write_candidate_crops(mask, candidates, debug_path / cfg["crops"])
+    repaired_overlay, repaired_mask_img = draw_repaired_circles(
+        mask, holes, candidates, expected_radius=expected_radius,
+    )
+    write_debug_image(debug_path / cfg["repaired_overlay"], repaired_overlay)
+    write_debug_image(debug_path / cfg["repaired_mask"], repaired_mask_img)
+    with open(debug_path / cfg["json"], "w", encoding="utf-8") as f:
+        json.dump(json_payload, f, ensure_ascii=False, indent=2)
+
+
 def build_secondary_origin_masks(image, contrast_gray, thresholds=None, blackhat_percentile=None):
     masks = {}
     thresholds = thresholds if thresholds is not None else [144, 152]
@@ -1454,38 +1615,6 @@ def build_secondary_origin_masks(image, contrast_gray, thresholds=None, blackhat
     return masks
 
 
-def deduplicate_secondary_origin_candidates(candidates, merge_radius):
-    class_rank = {"WEAK": 3, "BROKEN": 2, "MISSING": 1}
-    candidates = sorted(
-        candidates,
-        key=lambda item: (
-            class_rank.get(item["class"], 0),
-            item["area_ratio"],
-            item["template_overlap"],
-            item.get("detected_area", 0.0),
-        ),
-        reverse=True,
-    )
-
-    kept = []
-    for candidate in candidates:
-        center = np.array(candidate["center"], dtype=float)
-        duplicate = None
-        for kept_candidate in kept:
-            kept_center = np.array(kept_candidate["center"], dtype=float)
-            if np.linalg.norm(center - kept_center) <= merge_radius:
-                duplicate = kept_candidate
-                break
-
-        if duplicate is None:
-            candidate["mask_sources"] = [candidate["mask_source"]]
-            kept.append(candidate)
-        else:
-            duplicate.setdefault("mask_sources", []).append(candidate["mask_source"])
-
-    return kept
-
-
 def find_secondary_origin_candidates(
     mask_variants,
     points,
@@ -1493,6 +1622,7 @@ def find_secondary_origin_candidates(
     hole_stats,
     match_radius=8.0,
     roi_radius=14,
+    paper_mask=None,
 ):
     if not mask_variants or not points:
         return []
@@ -1512,18 +1642,12 @@ def find_secondary_origin_candidates(
                 continue
             if curve_mask[y, x] == 0:
                 continue
-
-            distances = np.hypot(accepted_points[:, 0] - x, accepted_points[:, 1] - y)
-            nearest_distance = float(np.min(distances))
-            if nearest_distance <= match_radius:
+            if not is_inside_paper(paper_mask, x, y):
                 continue
 
-            score = score_expected_hole_roi(
-                candidate_mask,
-                hole.center,
-                expected_area=expected_area,
-                expected_radius=expected_radius,
-                roi_radius=roi_radius,
+            score, nearest_distance = evaluate_candidate_position(
+                candidate_mask, x, y, accepted_points, match_radius,
+                expected_area, expected_radius, roi_radius,
             )
             if score is None or score["class"] == "MISSING":
                 continue
@@ -1543,7 +1667,13 @@ def find_secondary_origin_candidates(
                 }
             )
 
-    return deduplicate_secondary_origin_candidates(candidates, merge_radius=match_radius)
+    return deduplicate_candidates(
+        candidates,
+        merge_radius=match_radius,
+        sources_key="mask_sources",
+        source_extractor=lambda c: c["mask_source"],
+        sort_extras=lambda c: (c.get("detected_area", 0.0),),
+    )
 
 
 def analyze_curve_mode(
@@ -1565,11 +1695,13 @@ def analyze_curve_mode(
     secondary_origin_thresholds=None,
     secondary_origin_blackhat_percentile=None,
     secondary_origin_curve_extend_pixels=0,
+    paper_mask_mode="off",
 ):
     img, gray, mask = preprocess_image(image_path)
     holes = detect_hole_centers(mask)
     points = hole_points(holes)
     hole_stats = compute_hole_statistics(holes)
+    paper_mask = segment_paper_region(img, points) if paper_mask_mode == "on" else None
 
     edges = build_candidate_edges(points, min_dist=15, max_dist=dist_threshold)
     row_edges, col_edges = classify_edges_by_orientation(edges)
@@ -1623,6 +1755,12 @@ def analyze_curve_mode(
     curve_mask_overlay = draw_curve_mask_overlay(mask, row_curve_mask, col_curve_mask)
     write_debug_image(debug_path / "curve_mask_overlay.jpg", curve_mask_overlay)
 
+    if paper_mask is not None:
+        write_debug_image(debug_path / "paper_mask.jpg", paper_mask)
+        paper_overlay = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        paper_overlay[paper_mask == 0] = (0, 0, 200)
+        write_debug_image(debug_path / "paper_mask_overlay.jpg", paper_overlay)
+
     secondary_origin_row_curve_mask = build_curve_band_mask(
         mask.shape,
         row_models,
@@ -1658,6 +1796,7 @@ def analyze_curve_mode(
         hole_stats,
         match_radius=weak_match_radius,
         roi_radius=weak_roi_radius,
+        paper_mask=paper_mask,
     )
 
     expected_hole_candidates = find_expected_hole_candidates(
@@ -1669,6 +1808,7 @@ def analyze_curve_mode(
         match_radius=weak_match_radius,
         roi_radius=weak_roi_radius,
         gap_factor=weak_gap_factor,
+        paper_mask=paper_mask,
     )
     spacing_inferred_candidates, spacing_lattices = find_spacing_inferred_hole_candidates(
         mask,
@@ -1677,6 +1817,7 @@ def analyze_curve_mode(
         hole_stats,
         match_radius=weak_match_radius,
         roi_radius=weak_roi_radius,
+        paper_mask=paper_mask,
     )
     local_gap_row_candidates, local_gap_row_lines = find_local_gap_candidates(
         mask,
@@ -1687,6 +1828,7 @@ def analyze_curve_mode(
         roi_radius=weak_roi_radius,
         gap_factor=weak_gap_factor,
         endpoint_extend_steps=local_gap_endpoint_steps,
+        paper_mask=paper_mask,
     )
     local_gap_col_candidates, local_gap_col_lines = find_local_gap_candidates(
         mask,
@@ -1697,6 +1839,7 @@ def analyze_curve_mode(
         roi_radius=weak_roi_radius,
         gap_factor=weak_gap_factor,
         endpoint_extend_steps=local_gap_endpoint_steps,
+        paper_mask=paper_mask,
     )
     local_gap_candidates = local_gap_row_candidates + local_gap_col_candidates
     consensus_candidates, consensus_debug_only_candidates = merge_row_col_consensus_candidates(
@@ -1708,6 +1851,7 @@ def analyze_curve_mode(
         consensus_radius=weak_match_radius,
         match_radius=weak_match_radius,
         roi_radius=weak_roi_radius,
+        paper_mask=paper_mask,
     )
     weak_candidate_counts = {
         "WEAK": sum(1 for candidate in expected_hole_candidates if candidate["class"] == "WEAK"),
@@ -1728,115 +1872,55 @@ def analyze_curve_mode(
     for candidate in secondary_origin_candidates:
         for mask_source in candidate.get("mask_sources", [candidate.get("mask_source", "unknown")]):
             secondary_origin_source_counts[mask_source] = secondary_origin_source_counts.get(mask_source, 0) + 1
-    weak_candidates_overlay = draw_expected_hole_candidates(mask, points, expected_hole_candidates)
-    write_debug_image(debug_path / "expected_hole_candidates_overlay.jpg", weak_candidates_overlay)
-    write_candidate_crops(mask, expected_hole_candidates, debug_path / "expected_hole_candidate_crops.jpg")
-    repaired_circles_overlay, repaired_circles_mask = draw_repaired_circles(
-        mask,
-        holes,
-        expected_hole_candidates,
-        expected_radius=hole_stats.get("radius_median", 6.0) or 6.0,
-    )
-    write_debug_image(debug_path / "repaired_circles_overlay.jpg", repaired_circles_overlay)
-    write_debug_image(debug_path / "repaired_circles_mask.jpg", repaired_circles_mask)
-    with open(debug_path / "expected_hole_candidates.json", "w", encoding="utf-8") as f:
-        json.dump(expected_hole_candidates, f, ensure_ascii=False, indent=2)
+    expected_radius = hole_stats.get("radius_median", 6.0) or 6.0
 
-    spacing_candidates_overlay = draw_expected_hole_candidates(mask, points, spacing_inferred_candidates)
-    write_debug_image(debug_path / "spacing_inferred_circles_overlay.jpg", spacing_candidates_overlay)
-    write_candidate_crops(mask, spacing_inferred_candidates, debug_path / "spacing_inferred_circle_crops.jpg")
-    spacing_repaired_overlay, spacing_repaired_mask = draw_repaired_circles(
-        mask,
-        holes,
-        spacing_inferred_candidates,
-        expected_radius=hole_stats.get("radius_median", 6.0) or 6.0,
+    emit_strategy_artifacts(
+        "expected_hole", mask, holes, points,
+        expected_hole_candidates, expected_radius, debug_path,
+        json_payload=expected_hole_candidates,
     )
-    write_debug_image(debug_path / "spacing_repaired_circles_overlay.jpg", spacing_repaired_overlay)
-    write_debug_image(debug_path / "spacing_repaired_circles_mask.jpg", spacing_repaired_mask)
-    with open(debug_path / "spacing_inferred_circles.json", "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "lattices": spacing_lattices,
-                "candidates": spacing_inferred_candidates,
-            },
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    local_gap_overlay = draw_expected_hole_candidates(mask, points, local_gap_candidates)
-    write_debug_image(debug_path / "local_gap_candidates_overlay.jpg", local_gap_overlay)
-    write_candidate_crops(mask, local_gap_candidates, debug_path / "local_gap_candidate_crops.jpg")
-    local_gap_repaired_overlay, local_gap_repaired_mask = draw_repaired_circles(
-        mask,
-        holes,
-        local_gap_candidates,
-        expected_radius=hole_stats.get("radius_median", 6.0) or 6.0,
+    emit_strategy_artifacts(
+        "spacing_inferred", mask, holes, points,
+        spacing_inferred_candidates, expected_radius, debug_path,
+        json_payload={
+            "lattices": spacing_lattices,
+            "candidates": spacing_inferred_candidates,
+        },
     )
-    write_debug_image(debug_path / "local_gap_repaired_circles_overlay.jpg", local_gap_repaired_overlay)
-    write_debug_image(debug_path / "local_gap_repaired_circles_mask.jpg", local_gap_repaired_mask)
-    with open(debug_path / "local_gap_candidates.json", "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "row_lines": local_gap_row_lines,
-                "col_lines": local_gap_col_lines,
-                "row_candidates": local_gap_row_candidates,
-                "col_candidates": local_gap_col_candidates,
-            },
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
-
+    emit_strategy_artifacts(
+        "local_gap", mask, holes, points,
+        local_gap_candidates, expected_radius, debug_path,
+        json_payload={
+            "row_lines": local_gap_row_lines,
+            "col_lines": local_gap_col_lines,
+            "row_candidates": local_gap_row_candidates,
+            "col_candidates": local_gap_col_candidates,
+        },
+    )
     consensus_overlay = draw_row_col_consensus_candidates(
         mask,
         points,
         consensus_candidates,
         consensus_debug_only_candidates,
     )
-    write_debug_image(debug_path / "row_col_consensus_overlay.jpg", consensus_overlay)
-    write_candidate_crops(mask, consensus_candidates, debug_path / "row_col_consensus_candidate_crops.jpg")
-    consensus_repaired_overlay, consensus_repaired_mask = draw_repaired_circles(
-        mask,
-        holes,
-        consensus_candidates,
-        expected_radius=hole_stats.get("radius_median", 6.0) or 6.0,
+    emit_strategy_artifacts(
+        "consensus", mask, holes, points,
+        consensus_candidates, expected_radius, debug_path,
+        json_payload={
+            "consensus_candidates": consensus_candidates,
+            "debug_only_candidates": consensus_debug_only_candidates,
+        },
+        overlay_image=consensus_overlay,
     )
-    write_debug_image(debug_path / "consensus_repaired_circles_overlay.jpg", consensus_repaired_overlay)
-    write_debug_image(debug_path / "consensus_repaired_circles_mask.jpg", consensus_repaired_mask)
-    with open(debug_path / "row_col_consensus_candidates.json", "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "consensus_candidates": consensus_candidates,
-                "debug_only_candidates": consensus_debug_only_candidates,
-            },
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    secondary_origin_overlay = draw_expected_hole_candidates(mask, points, secondary_origin_candidates)
-    write_debug_image(debug_path / "secondary_origin_candidates_overlay.jpg", secondary_origin_overlay)
-    write_candidate_crops(mask, secondary_origin_candidates, debug_path / "secondary_origin_candidate_crops.jpg")
-    secondary_origin_repaired_overlay, secondary_origin_repaired_mask = draw_repaired_circles(
-        mask,
-        holes,
-        secondary_origin_candidates,
-        expected_radius=hole_stats.get("radius_median", 6.0) or 6.0,
+    emit_strategy_artifacts(
+        "secondary_origin", mask, holes, points,
+        secondary_origin_candidates, expected_radius, debug_path,
+        json_payload={
+            "masks": list(secondary_origin_masks.keys()),
+            "source_counts": secondary_origin_source_counts,
+            "candidates": secondary_origin_candidates,
+        },
     )
-    write_debug_image(debug_path / "secondary_origin_repaired_circles_overlay.jpg", secondary_origin_repaired_overlay)
-    write_debug_image(debug_path / "secondary_origin_repaired_circles_mask.jpg", secondary_origin_repaired_mask)
-    with open(debug_path / "secondary_origin_candidates.json", "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "masks": list(secondary_origin_masks.keys()),
-                "source_counts": secondary_origin_source_counts,
-                "candidates": secondary_origin_candidates,
-            },
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
 
     centers_overlay = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
     for point in points:
@@ -1950,6 +2034,10 @@ def analyze_curve_mode(
         "col_model_residual_median": float(np.median([m.median_residual for m in col_models])) if col_models else None,
     }
 
+    if paper_mask is not None:
+        metrics["paper_mask_mode"] = paper_mask_mode
+        metrics["paper_mask_pixels"] = int(np.count_nonzero(paper_mask))
+
     with open(debug_path / "curve_metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
 
@@ -2060,6 +2148,7 @@ def parse_args():
     parser.add_argument("--secondary_origin_thresholds", type=int, nargs="*", default=[144, 152])
     parser.add_argument("--secondary_origin_blackhat_percentile", type=float, default=None)
     parser.add_argument("--secondary_origin_curve_extend_pixels", type=int, default=0)
+    parser.add_argument("--paper_mask", choices=["on", "off"], default="off")
     return parser.parse_args()
 
 
@@ -2086,6 +2175,7 @@ if __name__ == "__main__":
             secondary_origin_thresholds=args.secondary_origin_thresholds,
             secondary_origin_blackhat_percentile=args.secondary_origin_blackhat_percentile,
             secondary_origin_curve_extend_pixels=args.secondary_origin_curve_extend_pixels,
+            paper_mask_mode=args.paper_mask,
         )
     else:
         output = args.output or "result_defect.jpg"

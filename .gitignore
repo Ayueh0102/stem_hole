@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Generated outputs
+result_*.jpg
+debug_*/
+_baseline/
+_verify/
+_final/
+
+# Tooling
+.claude/
