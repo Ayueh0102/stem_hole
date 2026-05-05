@@ -42,14 +42,39 @@ class CurveModel:
         self.derivative_coeffs = np.polyder(self.coeffs)
 
 
-def preprocess_image(image_path):
+def preprocess_image(
+    image_path,
+    threshold_mode="global",
+    adaptive_block_size=31,
+    adaptive_c=5,
+):
     img = cv2.imread(image_path)
     if img is None:
         raise FileNotFoundError(f"Unable to read image: {image_path}")
 
     contrast_img = np.clip(img * (80 / 127 + 1) - 80, 0, 255).astype(np.uint8)
     gray = cv2.cvtColor(contrast_img, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY_INV)
+
+    if threshold_mode == "adaptive":
+        # adaptiveThreshold's blockSize must be odd
+        block = int(adaptive_block_size)
+        if block % 2 == 0:
+            block += 1
+        mask = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            block,
+            int(adaptive_c),
+        )
+        # Suppress single-pixel speckle from adaptive threshold without
+        # eroding genuine 6-px holes.
+        open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
+    else:
+        _, mask = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY_INV)
+
     return img, gray, mask
 
 
@@ -1696,8 +1721,16 @@ def analyze_curve_mode(
     secondary_origin_blackhat_percentile=None,
     secondary_origin_curve_extend_pixels=0,
     paper_mask_mode="off",
+    threshold_mode="global",
+    adaptive_block_size=31,
+    adaptive_c=5,
 ):
-    img, gray, mask = preprocess_image(image_path)
+    img, gray, mask = preprocess_image(
+        image_path,
+        threshold_mode=threshold_mode,
+        adaptive_block_size=adaptive_block_size,
+        adaptive_c=adaptive_c,
+    )
     holes = detect_hole_centers(mask)
     points = hole_points(holes)
     hole_stats = compute_hole_statistics(holes)
@@ -1760,6 +1793,9 @@ def analyze_curve_mode(
         paper_overlay = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
         paper_overlay[paper_mask == 0] = (0, 0, 200)
         write_debug_image(debug_path / "paper_mask_overlay.jpg", paper_overlay)
+
+    if threshold_mode == "adaptive":
+        write_debug_image(debug_path / "adaptive_mask.jpg", mask)
 
     secondary_origin_row_curve_mask = build_curve_band_mask(
         mask.shape,
@@ -2038,6 +2074,11 @@ def analyze_curve_mode(
         metrics["paper_mask_mode"] = paper_mask_mode
         metrics["paper_mask_pixels"] = int(np.count_nonzero(paper_mask))
 
+    if threshold_mode != "global":
+        metrics["threshold_mode"] = threshold_mode
+        metrics["adaptive_block_size"] = adaptive_block_size
+        metrics["adaptive_c"] = adaptive_c
+
     with open(debug_path / "curve_metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
 
@@ -2055,8 +2096,21 @@ def analyze_curve_mode(
     print(f"debug 輸出：{debug_path}")
 
 
-def detect_and_link_limited_holes(image_path, output_path, dist_threshold=32, offset_threshold=3.0):
-    img, gray, mask = preprocess_image(image_path)
+def detect_and_link_limited_holes(
+    image_path,
+    output_path,
+    dist_threshold=32,
+    offset_threshold=3.0,
+    threshold_mode="global",
+    adaptive_block_size=31,
+    adaptive_c=5,
+):
+    img, gray, mask = preprocess_image(
+        image_path,
+        threshold_mode=threshold_mode,
+        adaptive_block_size=adaptive_block_size,
+        adaptive_c=adaptive_c,
+    )
     display_img = img.copy()
     bw_display_img = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 
@@ -2149,6 +2203,9 @@ def parse_args():
     parser.add_argument("--secondary_origin_blackhat_percentile", type=float, default=None)
     parser.add_argument("--secondary_origin_curve_extend_pixels", type=int, default=0)
     parser.add_argument("--paper_mask", choices=["on", "off"], default="off")
+    parser.add_argument("--threshold_mode", choices=["global", "adaptive"], default="global")
+    parser.add_argument("--adaptive_block_size", type=int, default=31)
+    parser.add_argument("--adaptive_c", type=int, default=5)
     return parser.parse_args()
 
 
@@ -2176,6 +2233,9 @@ if __name__ == "__main__":
             secondary_origin_blackhat_percentile=args.secondary_origin_blackhat_percentile,
             secondary_origin_curve_extend_pixels=args.secondary_origin_curve_extend_pixels,
             paper_mask_mode=args.paper_mask,
+            threshold_mode=args.threshold_mode,
+            adaptive_block_size=args.adaptive_block_size,
+            adaptive_c=args.adaptive_c,
         )
     else:
         output = args.output or "result_defect.jpg"
@@ -2184,4 +2244,7 @@ if __name__ == "__main__":
             output,
             dist_threshold=args.dist_threshold,
             offset_threshold=args.offset_threshold,
+            threshold_mode=args.threshold_mode,
+            adaptive_block_size=args.adaptive_block_size,
+            adaptive_c=args.adaptive_c,
         )
