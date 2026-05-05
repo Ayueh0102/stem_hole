@@ -1617,6 +1617,97 @@ def emit_strategy_artifacts(
         json.dump(json_payload, f, ensure_ascii=False, indent=2)
 
 
+METRICS_BASELINE_SKIP_KEYS = frozenset({
+    "image_path",
+    "weak_match_radius",
+    "weak_roi_radius",
+    "weak_gap_factor",
+    "weak_extend_steps",
+    "local_gap_endpoint_steps",
+    "curve_extend_pixels",
+    "curve_extend_mode",
+    "curve_mask_expand_pixels",
+    "line_grouping",
+    "line_cluster_gap",
+    "line_direction_vote_margin",
+    "secondary_origin_thresholds",
+    "secondary_origin_blackhat_percentile",
+    "secondary_origin_curve_extend_pixels",
+    "paper_mask_mode",
+    "threshold_mode",
+    "adaptive_block_size",
+    "adaptive_c",
+})
+
+
+def _diff_metrics_recursive(prefix, current, baseline, deltas):
+    if isinstance(current, dict) and isinstance(baseline, dict):
+        for key in sorted(set(current.keys()) | set(baseline.keys())):
+            if not prefix and key in METRICS_BASELINE_SKIP_KEYS:
+                continue
+            sub_prefix = f"{prefix}.{key}" if prefix else key
+            _diff_metrics_recursive(sub_prefix, current.get(key), baseline.get(key), deltas)
+        return
+
+    if isinstance(current, (int, float)) and isinstance(baseline, (int, float)):
+        if current != baseline:
+            deltas.append({
+                "key": prefix,
+                "baseline": baseline,
+                "current": current,
+                "delta": current - baseline,
+            })
+        return
+
+    if current != baseline:
+        deltas.append({
+            "key": prefix,
+            "baseline": baseline,
+            "current": current,
+        })
+
+
+def compare_metrics_to_baseline(metrics, baseline_path, debug_path):
+    """Diff current metrics against a saved baseline JSON. Writes a
+    metrics_baseline_diff.json next to other debug artifacts and prints
+    a human-readable summary. Returns the number of deltas detected."""
+    baseline_path = Path(baseline_path)
+    if not baseline_path.exists():
+        print(f"⚠ baseline not found: {baseline_path}")
+        return -1
+
+    with open(baseline_path, "r", encoding="utf-8") as f:
+        baseline = json.load(f)
+
+    deltas = []
+    _diff_metrics_recursive("", metrics, baseline, deltas)
+
+    output = {
+        "baseline_path": str(baseline_path),
+        "delta_count": len(deltas),
+        "deltas": deltas,
+    }
+    with open(debug_path / "metrics_baseline_diff.json", "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+
+    if not deltas:
+        print(f"✓ metrics match baseline {baseline_path}")
+        return 0
+
+    print(f"⚠ {len(deltas)} metric(s) differ from baseline {baseline_path}:")
+    for delta in deltas[:15]:
+        base = delta["baseline"]
+        cur = delta["current"]
+        if isinstance(cur, (int, float)) and isinstance(base, (int, float)):
+            sign = "+" if delta["delta"] > 0 else ""
+            print(f"  {delta['key']}: {base} → {cur} ({sign}{delta['delta']:g})")
+        else:
+            print(f"  {delta['key']}: {base!r} → {cur!r}")
+    if len(deltas) > 15:
+        print(f"  ... and {len(deltas) - 15} more (see metrics_baseline_diff.json)")
+    return len(deltas)
+
+
 def build_secondary_origin_masks(image, contrast_gray, thresholds=None, blackhat_percentile=None):
     masks = {}
     thresholds = thresholds if thresholds is not None else [144, 152]
@@ -1724,6 +1815,7 @@ def analyze_curve_mode(
     threshold_mode="global",
     adaptive_block_size=31,
     adaptive_c=5,
+    metrics_baseline=None,
 ):
     img, gray, mask = preprocess_image(
         image_path,
@@ -2082,6 +2174,9 @@ def analyze_curve_mode(
     with open(debug_path / "curve_metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
 
+    if metrics_baseline is not None:
+        compare_metrics_to_baseline(metrics, metrics_baseline, debug_path)
+
     print(
         "曲線模式完成："
         f"共找到 {len(points)} 個孔，"
@@ -2206,6 +2301,8 @@ def parse_args():
     parser.add_argument("--threshold_mode", choices=["global", "adaptive"], default="global")
     parser.add_argument("--adaptive_block_size", type=int, default=31)
     parser.add_argument("--adaptive_c", type=int, default=5)
+    parser.add_argument("--metrics_baseline", type=str, default=None,
+                        help="Path to baseline curve_metrics.json for regression diff")
     return parser.parse_args()
 
 
@@ -2236,6 +2333,7 @@ if __name__ == "__main__":
             threshold_mode=args.threshold_mode,
             adaptive_block_size=args.adaptive_block_size,
             adaptive_c=args.adaptive_c,
+            metrics_baseline=args.metrics_baseline,
         )
     else:
         output = args.output or "result_defect.jpg"

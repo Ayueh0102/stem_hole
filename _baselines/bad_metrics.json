@@ -1,0 +1,96 @@
+{
+  "image_path": "sample/bad.png",
+  "hole_stats": {
+    "count": 1908,
+    "area_median": 83.5,
+    "area_mad": 11.0,
+    "radius_median": 5.932622671127319,
+    "radius_mad": 0.3166837692260742,
+    "circularity_median": 0.7752294793839186,
+    "circularity_mad": 0.051885190288379124
+  },
+  "centers": 1908,
+  "candidate_edges": 1864,
+  "row_edges": 800,
+  "col_edges": 1064,
+  "row_grouping_points": 779,
+  "col_grouping_points": 1056,
+  "row_chains": 6,
+  "col_chains": 11,
+  "line_grouping": "point_axis_cluster",
+  "line_cluster_gap": 80,
+  "line_direction_vote_margin": 1,
+  "row_models": 6,
+  "col_models": 11,
+  "row_outliers": 18,
+  "col_outliers": 20,
+  "curve_outliers": 38,
+  "curve_extend_pixels": 80,
+  "curve_extend_mode": "endpoint_tangent",
+  "curve_mask_expand_pixels": 8,
+  "row_curve_mask_pixels": 513821,
+  "col_curve_mask_pixels": 856530,
+  "combined_curve_mask_pixels": 1346504,
+  "weak_extend_steps": 0,
+  "weak_match_radius": 8.0,
+  "weak_roi_radius": 14,
+  "weak_gap_factor": 1.55,
+  "local_gap_endpoint_steps": 2,
+  "secondary_origin_thresholds": [
+    144,
+    152
+  ],
+  "secondary_origin_blackhat_percentile": null,
+  "secondary_origin_curve_extend_pixels": 0,
+  "expected_hole_candidates": 103,
+  "expected_hole_candidate_counts": {
+    "WEAK": 71,
+    "BROKEN": 32,
+    "MISSING": 0
+  },
+  "spacing_lattices": 17,
+  "spacing_inferred_candidates": 249,
+  "spacing_inferred_candidate_counts": {
+    "WEAK": 30,
+    "BROKEN": 73,
+    "MISSING": 146
+  },
+  "local_gap_candidates": 69,
+  "local_gap_candidate_counts": {
+    "WEAK": 54,
+    "BROKEN": 15,
+    "MISSING": 0
+  },
+  "local_gap_support_counts": {
+    "row": 26,
+    "col": 43
+  },
+  "row_col_consensus_candidates": 1,
+  "row_col_consensus_candidate_counts": {
+    "WEAK": 1,
+    "BROKEN": 0,
+    "MISSING": 0
+  },
+  "row_col_consensus_debug_only_candidates": 67,
+  "row_col_consensus_debug_only_counts": {
+    "row_only": 25,
+    "col_only": 42
+  },
+  "secondary_origin_candidates": 145,
+  "secondary_origin_candidate_counts": {
+    "WEAK": 145,
+    "BROKEN": 0,
+    "MISSING": 0
+  },
+  "secondary_origin_source_counts": {
+    "global_t152": 144,
+    "global_t144": 136
+  },
+  "repaired_circle_count": 2011,
+  "spacing_repaired_circle_count": 2157,
+  "local_gap_repaired_circle_count": 1977,
+  "consensus_repaired_circle_count": 1909,
+  "secondary_origin_repaired_circle_count": 2053,
+  "row_model_residual_median": 0.5624370510646486,
+  "col_model_residual_median": 0.46856489921174216
+}
