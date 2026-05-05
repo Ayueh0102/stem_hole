@@ -1386,6 +1386,37 @@ def find_grid_prior_candidates(
     return deduplicate_candidates(candidates, merge_radius=match_radius), lattices
 
 
+def annotate_grid_prior_consensus(candidates):
+    """Tag each grid_prior candidate with cross-line support.
+
+    Phase 2D v1 ran ``find_grid_prior_candidates`` over both row and
+    col models, then deduped close candidates. The dedup helper records
+    the originating line in ``merged_sources``: if a predicted position
+    appears on BOTH a row lattice AND a col lattice, the merged
+    candidate carries entries with both orientations. This function
+    surfaces that signal as a top-level ``cross_supported`` flag and
+    promotes the candidate's class one level (MISSING -> BROKEN ->
+    WEAK) to reflect the stronger prior. The unpromoted class is kept
+    in ``original_class`` for traceability.
+
+    Mutates and returns the same list (a new dict per candidate).
+    """
+    annotated = []
+    promote = {"MISSING": "BROKEN", "BROKEN": "WEAK", "WEAK": "WEAK"}
+    for candidate in candidates:
+        sources = candidate.get("merged_sources", [])
+        orientations = {s.get("orientation") for s in sources if isinstance(s, dict)}
+        cross_supported = "row" in orientations and "col" in orientations
+        new_candidate = dict(candidate)
+        new_candidate["cross_supported"] = bool(cross_supported)
+        new_candidate["support_orientations"] = sorted(orientations)
+        if cross_supported:
+            new_candidate["original_class"] = candidate.get("class")
+            new_candidate["class"] = promote.get(candidate.get("class"), candidate.get("class"))
+        annotated.append(new_candidate)
+    return annotated
+
+
 def find_local_gap_candidates(
     mask,
     points,
@@ -2299,6 +2330,7 @@ def analyze_curve_mode(
             roi_radius=weak_roi_radius,
             scorer=scorer, gray=gray, template=hole_template,
         )
+        grid_prior_candidates = annotate_grid_prior_consensus(grid_prior_candidates)
     else:
         grid_prior_candidates, grid_prior_lattices = [], []
     weak_candidate_counts = {
@@ -2512,6 +2544,9 @@ def analyze_curve_mode(
         metrics["grid_prior_candidate_counts"] = count_candidates_by_class(grid_prior_candidates)
         metrics["grid_prior_extension_total"] = int(sum(
             l.get("extension_count", 0) for l in grid_prior_lattices
+        ))
+        metrics["grid_prior_cross_supported"] = int(sum(
+            1 for c in grid_prior_candidates if c.get("cross_supported")
         ))
 
     with open(debug_path / "curve_metrics.json", "w", encoding="utf-8") as f:
