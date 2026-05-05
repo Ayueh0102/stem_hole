@@ -848,6 +848,106 @@ def score_expected_hole_roi(
     }
 
 
+def build_hole_template(radius, feather=3.0):
+    """Synthesize a circular hole template for cv2.matchTemplate.
+
+    In the contrast-boosted grayscale produced by ``preprocess_image``,
+    holes appear as DARK disks against a BRIGHT stamp body (the contrast
+    boost stretches mid-tones such that punched-paper show-through ends
+    up below the threshold while ink stays above). The template mirrors
+    that polarity: dark disk on bright background. The feather edge
+    improves NCC stability against minor radius/blur variation.
+
+    Returns a uint8 image of odd size whose centre coincides with the
+    disk centre.
+    """
+    radius = max(2.0, float(radius))
+    feather = max(1.0, float(feather))
+    size = int(np.ceil(radius * 2 + feather * 2 + 2))
+    if size % 2 == 0:
+        size += 1
+    cy = cx = size // 2
+    yy, xx = np.ogrid[:size, :size]
+    distance = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+    inside = np.clip(1.0 - (distance - radius) / feather, 0.0, 1.0)
+    # Dark disk (0) on bright surround (255).
+    return ((1.0 - inside) * 255).astype(np.uint8)
+
+
+def score_expected_hole_template(
+    gray,
+    center,
+    template,
+    expected_radius,
+    roi_radius,
+    weak_ncc=0.55,
+    broken_ncc=0.30,
+):
+    """Score a candidate position via normalized cross-correlation
+    against a synthesized hole template.
+
+    Returns a dict with the same key set as :func:`score_expected_hole_roi`
+    so downstream filters and dict assemblers stay byte-compatible. NCC
+    fields populate ``area_ratio`` and ``template_overlap`` so the legacy
+    threshold-based logic and frame-line filter degrade gracefully.
+    """
+    height, width = gray.shape[:2]
+    th, tw = template.shape[:2]
+    cx_int = int(round(float(center[0])))
+    cy_int = int(round(float(center[1])))
+
+    # Search window must fit at least one template-sized stamp; expand
+    # search radius around the candidate by roi_radius pixels.
+    search_half = max(int(roi_radius), th // 2 + 2)
+    x1 = max(0, cx_int - search_half)
+    y1 = max(0, cy_int - search_half)
+    x2 = min(width, cx_int + search_half + 1)
+    y2 = min(height, cy_int + search_half + 1)
+    window = gray[y1:y2, x1:x2]
+    if window.shape[0] < th or window.shape[1] < tw:
+        return None
+
+    result = cv2.matchTemplate(window, template, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, max_loc = cv2.minMaxLoc(result)
+    ncc = float(max_val)
+
+    # Center of best match in image coordinates
+    best_x = float(x1 + max_loc[0] + tw / 2.0)
+    best_y = float(y1 + max_loc[1] + th / 2.0)
+    centroid_shift = float(np.hypot(best_x - float(center[0]), best_y - float(center[1])))
+
+    if ncc >= weak_ncc and centroid_shift <= expected_radius * 0.9:
+        candidate_class = "WEAK"
+    elif ncc >= broken_ncc and centroid_shift <= expected_radius * 1.35:
+        candidate_class = "BROKEN"
+    else:
+        candidate_class = "MISSING"
+
+    # Mirror the ``score_expected_hole_roi`` schema so consumers that
+    # spread ``**score`` into candidate dicts emit a stable key set
+    # regardless of which scorer ran. Component-shape fields are not
+    # meaningful for NCC-based scoring; expose them as ``None`` so
+    # ``is_frame_line_like_score`` returns False (its early-return
+    # guard rejects ``None`` shape inputs).
+    return {
+        "class": candidate_class,
+        "observed_area": 0,
+        "expected_area": 0.0,
+        "area_ratio": ncc,
+        "template_overlap": ncc,
+        "centroid_x": best_x,
+        "centroid_y": best_y,
+        "centroid_shift": centroid_shift,
+        "component_width": None,
+        "component_height": None,
+        "component_area": None,
+        "component_aspect_ratio": None,
+        "component_roi_span_x": None,
+        "component_roi_span_y": None,
+        "component_fill_ratio": None,
+    }
+
+
 def evaluate_candidate_position(
     mask,
     x,
@@ -857,26 +957,43 @@ def evaluate_candidate_position(
     expected_area,
     expected_radius,
     roi_radius,
+    scorer="area",
+    gray=None,
+    template=None,
 ):
     """Run the shared NN-rejection + ROI scoring for a candidate position.
 
     Returns ``(score | None, nearest_distance)``. ``score`` is ``None`` if the
-    candidate falls within ``match_radius`` of any accepted point or if
-    ``score_expected_hole_roi`` rejects the ROI. Callers stay responsible for
-    bounds checks, secondary gates (e.g. curve-mask, frame-line filters),
-    and final dict construction so JSON key order is preserved per site.
+    candidate falls within ``match_radius`` of any accepted point or if the
+    selected scorer rejects the ROI. Callers stay responsible for bounds
+    checks, secondary gates (e.g. curve-mask, frame-line filters), and
+    final dict construction so JSON key order is preserved per site.
+
+    ``scorer`` selects between the legacy mask-area scorer (``"area"``,
+    default, byte-equivalent to prior behaviour) and the NCC template
+    scorer (``"template"``, requires ``gray`` and ``template`` kwargs).
     """
     distances = np.hypot(accepted_points[:, 0] - x, accepted_points[:, 1] - y)
     nearest_distance = float(np.min(distances))
     if nearest_distance <= match_radius:
         return None, nearest_distance
-    score = score_expected_hole_roi(
-        mask,
-        (x, y),
-        expected_area=expected_area,
-        expected_radius=expected_radius,
-        roi_radius=roi_radius,
-    )
+
+    if scorer == "template":
+        score = score_expected_hole_template(
+            gray,
+            (x, y),
+            template,
+            expected_radius=expected_radius,
+            roi_radius=roi_radius,
+        )
+    else:
+        score = score_expected_hole_roi(
+            mask,
+            (x, y),
+            expected_area=expected_area,
+            expected_radius=expected_radius,
+            roi_radius=roi_radius,
+        )
     return score, nearest_distance
 
 
@@ -977,6 +1094,9 @@ def find_expected_hole_candidates(
     roi_radius=14,
     gap_factor=1.55,
     paper_mask=None,
+    scorer="area",
+    gray=None,
+    template=None,
 ):
     if not points or not models:
         return []
@@ -1041,6 +1161,7 @@ def find_expected_hole_candidates(
             score, nearest_distance = evaluate_candidate_position(
                 mask, x, y, accepted_points, match_radius,
                 expected_area, expected_radius, roi_radius,
+                scorer=scorer, gray=gray, template=template,
             )
             if score is None:
                 continue
@@ -1068,6 +1189,9 @@ def find_spacing_inferred_hole_candidates(
     match_radius=8.0,
     roi_radius=14,
     paper_mask=None,
+    scorer="area",
+    gray=None,
+    template=None,
 ):
     if not points or not models:
         return [], []
@@ -1105,6 +1229,7 @@ def find_spacing_inferred_hole_candidates(
             score, nearest_distance = evaluate_candidate_position(
                 mask, x, y, accepted_points, match_radius,
                 expected_area, expected_radius, roi_radius,
+                scorer=scorer, gray=gray, template=template,
             )
             if score is None:
                 continue
@@ -1137,6 +1262,9 @@ def find_local_gap_candidates(
     max_slot_span=4,
     endpoint_extend_steps=2,
     paper_mask=None,
+    scorer="area",
+    gray=None,
+    template=None,
 ):
     if not points or not models:
         return [], []
@@ -1174,6 +1302,7 @@ def find_local_gap_candidates(
             score, nearest_distance = evaluate_candidate_position(
                 mask, x, y, accepted_points, match_radius,
                 expected_area, expected_radius, roi_radius,
+                scorer=scorer, gray=gray, template=template,
             )
             if score is None:
                 return False, nearest_distance > match_radius
@@ -1307,6 +1436,9 @@ def merge_row_col_consensus_candidates(
     match_radius=8.0,
     roi_radius=14,
     paper_mask=None,
+    scorer="area",
+    gray=None,
+    template=None,
 ):
     if not row_candidates and not col_candidates:
         return [], []
@@ -1343,6 +1475,7 @@ def merge_row_col_consensus_candidates(
         score, nearest_distance = evaluate_candidate_position(
             mask, center[0], center[1], accepted_points, match_radius,
             expected_area, expected_radius, roi_radius,
+            scorer=scorer, gray=gray, template=template,
         )
         if score is None:
             continue
@@ -1739,6 +1872,9 @@ def find_secondary_origin_candidates(
     match_radius=8.0,
     roi_radius=14,
     paper_mask=None,
+    scorer="area",
+    gray=None,
+    template=None,
 ):
     if not mask_variants or not points:
         return []
@@ -1764,6 +1900,7 @@ def find_secondary_origin_candidates(
             score, nearest_distance = evaluate_candidate_position(
                 candidate_mask, x, y, accepted_points, match_radius,
                 expected_area, expected_radius, roi_radius,
+                scorer=scorer, gray=gray, template=template,
             )
             if score is None or score["class"] == "MISSING":
                 continue
@@ -1816,6 +1953,7 @@ def analyze_curve_mode(
     adaptive_block_size=31,
     adaptive_c=5,
     metrics_baseline=None,
+    scorer="area",
 ):
     img, gray, mask = preprocess_image(
         image_path,
@@ -1827,6 +1965,11 @@ def analyze_curve_mode(
     points = hole_points(holes)
     hole_stats = compute_hole_statistics(holes)
     paper_mask = segment_paper_region(img, points) if paper_mask_mode == "on" else None
+    if scorer == "template":
+        template_radius = float(hole_stats.get("radius_median", 6.0) or 6.0)
+        hole_template = build_hole_template(template_radius)
+    else:
+        hole_template = None
 
     edges = build_candidate_edges(points, min_dist=15, max_dist=dist_threshold)
     row_edges, col_edges = classify_edges_by_orientation(edges)
@@ -1925,6 +2068,7 @@ def analyze_curve_mode(
         match_radius=weak_match_radius,
         roi_radius=weak_roi_radius,
         paper_mask=paper_mask,
+        scorer=scorer, gray=gray, template=hole_template,
     )
 
     expected_hole_candidates = find_expected_hole_candidates(
@@ -1937,6 +2081,7 @@ def analyze_curve_mode(
         roi_radius=weak_roi_radius,
         gap_factor=weak_gap_factor,
         paper_mask=paper_mask,
+        scorer=scorer, gray=gray, template=hole_template,
     )
     spacing_inferred_candidates, spacing_lattices = find_spacing_inferred_hole_candidates(
         mask,
@@ -1946,6 +2091,7 @@ def analyze_curve_mode(
         match_radius=weak_match_radius,
         roi_radius=weak_roi_radius,
         paper_mask=paper_mask,
+        scorer=scorer, gray=gray, template=hole_template,
     )
     local_gap_row_candidates, local_gap_row_lines = find_local_gap_candidates(
         mask,
@@ -1957,6 +2103,7 @@ def analyze_curve_mode(
         gap_factor=weak_gap_factor,
         endpoint_extend_steps=local_gap_endpoint_steps,
         paper_mask=paper_mask,
+        scorer=scorer, gray=gray, template=hole_template,
     )
     local_gap_col_candidates, local_gap_col_lines = find_local_gap_candidates(
         mask,
@@ -1968,6 +2115,7 @@ def analyze_curve_mode(
         gap_factor=weak_gap_factor,
         endpoint_extend_steps=local_gap_endpoint_steps,
         paper_mask=paper_mask,
+        scorer=scorer, gray=gray, template=hole_template,
     )
     local_gap_candidates = local_gap_row_candidates + local_gap_col_candidates
     consensus_candidates, consensus_debug_only_candidates = merge_row_col_consensus_candidates(
@@ -1980,6 +2128,7 @@ def analyze_curve_mode(
         match_radius=weak_match_radius,
         roi_radius=weak_roi_radius,
         paper_mask=paper_mask,
+        scorer=scorer, gray=gray, template=hole_template,
     )
     weak_candidate_counts = {
         "WEAK": sum(1 for candidate in expected_hole_candidates if candidate["class"] == "WEAK"),
@@ -2171,6 +2320,11 @@ def analyze_curve_mode(
         metrics["adaptive_block_size"] = adaptive_block_size
         metrics["adaptive_c"] = adaptive_c
 
+    if scorer != "area":
+        metrics["scorer"] = scorer
+        if hole_template is not None:
+            metrics["template_size"] = int(hole_template.shape[0])
+
     with open(debug_path / "curve_metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
 
@@ -2303,6 +2457,8 @@ def parse_args():
     parser.add_argument("--adaptive_c", type=int, default=5)
     parser.add_argument("--metrics_baseline", type=str, default=None,
                         help="Path to baseline curve_metrics.json for regression diff")
+    parser.add_argument("--scorer", choices=["area", "template"], default="area",
+                        help="Candidate scoring backend: area (legacy mask area) or template (NCC)")
     return parser.parse_args()
 
 
@@ -2334,6 +2490,7 @@ if __name__ == "__main__":
             adaptive_block_size=args.adaptive_block_size,
             adaptive_c=args.adaptive_c,
             metrics_baseline=args.metrics_baseline,
+            scorer=args.scorer,
         )
     else:
         output = args.output or "result_defect.jpg"
