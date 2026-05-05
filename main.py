@@ -1445,6 +1445,175 @@ def annotate_grid_prior_consensus(candidates):
     return annotated
 
 
+def find_lattice_verified_real_holes(
+    image,
+    points,
+    row_models,
+    col_models,
+    hole_stats,
+    paper_mask,
+    image_shape,
+    hough_param1=80,
+    hough_param2=12,
+    hough_radius_slack=3,
+    hough_min_dist_factor=1.5,
+    fallback_pitch_factor=0.5,
+    cross_line_dedup_factor=0.4,
+    off_grid_radius_factor=1.5,
+):
+    """Verify lattice-predicted hole positions with cv2.HoughCircles.
+
+    The user's domain insight (paraphrased): given the row/col counts,
+    fit curves through the perforation grid (handling lens distortion
+    via per-line polyfit), regress the slot pitch + phase from the
+    middle (densely-correct) detections, predict every slot position,
+    then **verify each predicted position with HoughCircles** — only
+    positions where a real circular feature exists count as a true
+    hole; positions where no circle is found are genuine defects.
+
+    Hough is significantly more selective than threshold-based detection:
+    it requires the local image gradient to form a closed circular
+    boundary, so printed-text strokes (which are not circular) cannot
+    impersonate holes the way they fool the area scorer. Conversely,
+    weak holes that retain a faint circular edge still register with
+    Hough even when their interior brightness is borderline.
+
+    Returns a dict with:
+      hough_circles_total      : int, all circles HoughCircles found
+      slot_positions_total     : int, lattice slots after cross-line dedup
+      verified                 : list of slot dicts where Hough confirmed
+      fallback_recovered       : list of slots where Hough missed but a
+                                 detected hole sits within slot tolerance
+      true_defects             : list of slots with neither Hough hit nor
+                                 detection nearby — the genuine misses
+      off_grid_anomalies       : Hough circles that don't lie on any slot
+                                 (mid-stamp text, illustration features,
+                                 or genuine off-grid perforations)
+    """
+    raw_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    expected_radius = float(hole_stats.get("radius_median", 6.0) or 6.0)
+    height, width = image_shape[:2]
+
+    blurred = cv2.medianBlur(raw_gray, 5)
+    hough = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1.0,
+        minDist=int(max(2, expected_radius * hough_min_dist_factor)),
+        param1=int(hough_param1),
+        param2=int(hough_param2),
+        minRadius=max(2, int(expected_radius - hough_radius_slack)),
+        maxRadius=int(expected_radius + hough_radius_slack),
+    )
+    hough_centers = hough[0, :, :2] if hough is not None else np.empty((0, 2), dtype=float)
+
+    slot_positions = []
+    for model in list(row_models) + list(col_models):
+        lattice = estimate_spacing_lattice(points, model)
+        if lattice is None:
+            continue
+        pitch = float(lattice["pitch"])
+        phase = float(lattice["phase"])
+        slot_min, slot_max = extend_lattice_to_paper(model, lattice, paper_mask, image_shape)
+        for slot in range(slot_min, slot_max + 1):
+            x, y = evaluate_curve_point(model, phase + pitch * slot)
+            if x < 0 or y < 0 or x >= width or y >= height:
+                continue
+            if not is_inside_paper(paper_mask, x, y):
+                continue
+            slot_positions.append({
+                "center": [float(x), float(y)],
+                "pitch": pitch,
+                "slot": int(slot),
+                "orientation": model.orientation,
+                "line_id": model.line_id,
+            })
+
+    deduped_slots = []
+    for slot in slot_positions:
+        x, y = slot["center"]
+        is_dup = False
+        for kept in deduped_slots:
+            kx, ky = kept["center"]
+            tol = max(slot["pitch"], kept["pitch"]) * cross_line_dedup_factor
+            if (kx - x) ** 2 + (ky - y) ** 2 < tol * tol:
+                is_dup = True
+                break
+        if not is_dup:
+            deduped_slots.append(slot)
+
+    accepted_points = np.array(points, dtype=float) if points else np.empty((0, 2), dtype=float)
+
+    verified = []
+    fallback = []
+    defects = []
+    for slot in deduped_slots:
+        sx, sy = slot["center"]
+        slot_tol = slot["pitch"] * fallback_pitch_factor
+
+        hough_dist = float("inf")
+        if len(hough_centers) > 0:
+            d = np.hypot(hough_centers[:, 0] - sx, hough_centers[:, 1] - sy)
+            hough_dist = float(d.min())
+
+        if hough_dist <= slot_tol:
+            verified.append({**slot, "hough_distance": hough_dist, "source": "hough"})
+            continue
+
+        det_dist = float("inf")
+        if len(accepted_points) > 0:
+            d = np.hypot(accepted_points[:, 0] - sx, accepted_points[:, 1] - sy)
+            det_dist = float(d.min())
+
+        if det_dist <= slot_tol:
+            fallback.append({
+                **slot,
+                "hough_distance": hough_dist,
+                "detection_distance": det_dist,
+                "source": "fallback",
+            })
+            continue
+
+        defects.append({
+            **slot,
+            "hough_distance": hough_dist,
+            "detection_distance": det_dist,
+        })
+
+    off_grid = []
+    if len(deduped_slots) > 0 and len(hough_centers) > 0:
+        slot_xy = np.array([s["center"] for s in deduped_slots], dtype=float)
+        for hx, hy in hough_centers:
+            d = np.hypot(slot_xy[:, 0] - hx, slot_xy[:, 1] - hy)
+            if float(d.min()) > expected_radius * off_grid_radius_factor:
+                off_grid.append({"center": [float(hx), float(hy)]})
+
+    return {
+        "hough_circles_total": int(len(hough_centers)),
+        "slot_positions_total": len(deduped_slots),
+        "verified": verified,
+        "fallback_recovered": fallback,
+        "true_defects": defects,
+        "off_grid_anomalies": off_grid,
+    }
+
+
+def enforce_chain_count(chains, target_count):
+    """If the user specified an expected line count and the auto-detected
+    chains exceed it, keep only the largest ``target_count`` chains. Smaller
+    chains in the over-segmented case are usually noise clusters that
+    happened to pass min_line_points.
+
+    Returns the (possibly trimmed) chain list. If ``target_count`` is None
+    or already <= len(chains), the input is returned unchanged.
+    """
+    if target_count is None or target_count <= 0:
+        return chains
+    if len(chains) <= target_count:
+        return chains
+    return sorted(chains, key=len, reverse=True)[:target_count]
+
+
 def find_local_gap_candidates(
     mask,
     points,
@@ -2166,6 +2335,11 @@ def analyze_curve_mode(
     scorer="area",
     grid_prior_mode="off",
     filter_orphan_holes_mode="off",
+    row_lines=None,
+    col_lines=None,
+    hough_verify_mode="off",
+    hough_param1=80,
+    hough_param2=12,
 ):
     img, gray, mask = preprocess_image(
         image_path,
@@ -2205,6 +2379,8 @@ def analyze_curve_mode(
         cluster_gap=line_cluster_gap,
         candidate_indices=col_point_indices,
     )
+    row_chains = enforce_chain_count(row_chains, row_lines)
+    col_chains = enforce_chain_count(col_chains, col_lines)
     row_models = fit_curve_models(points, row_chains, "row", degree=poly_degree)
     col_models = fit_curve_models(points, col_chains, "col", degree=poly_degree)
 
@@ -2391,6 +2567,21 @@ def analyze_curve_mode(
         grid_prior_candidates = annotate_grid_prior_consensus(grid_prior_candidates)
     else:
         grid_prior_candidates, grid_prior_lattices = [], []
+
+    if hough_verify_mode == "on":
+        hough_result = find_lattice_verified_real_holes(
+            img,
+            points,
+            row_models,
+            col_models,
+            hole_stats,
+            paper_mask,
+            mask.shape,
+            hough_param1=hough_param1,
+            hough_param2=hough_param2,
+        )
+    else:
+        hough_result = None
     weak_candidate_counts = {
         "WEAK": sum(1 for candidate in expected_hole_candidates if candidate["class"] == "WEAK"),
         "BROKEN": sum(1 for candidate in expected_hole_candidates if candidate["class"] == "BROKEN"),
@@ -2469,6 +2660,36 @@ def analyze_curve_mode(
                 "candidates": grid_prior_candidates,
             },
         )
+
+    if hough_result is not None:
+        hough_overlay = img.copy()
+        radius_int = max(2, int(round(expected_radius)))
+        for slot in hough_result["verified"]:
+            cx, cy = int(round(slot["center"][0])), int(round(slot["center"][1]))
+            cv2.circle(hough_overlay, (cx, cy), radius_int + 2, (0, 255, 0), 2)
+        for slot in hough_result["fallback_recovered"]:
+            cx, cy = int(round(slot["center"][0])), int(round(slot["center"][1]))
+            cv2.circle(hough_overlay, (cx, cy), radius_int + 2, (0, 255, 255), 2)
+        for slot in hough_result["true_defects"]:
+            cx, cy = int(round(slot["center"][0])), int(round(slot["center"][1]))
+            cv2.circle(hough_overlay, (cx, cy), radius_int + 3, (0, 0, 255), 3)
+        for circle in hough_result["off_grid_anomalies"]:
+            cx, cy = int(round(circle["center"][0])), int(round(circle["center"][1]))
+            cv2.drawMarker(hough_overlay, (cx, cy), (255, 0, 255), cv2.MARKER_DIAMOND, 12, 1)
+        write_debug_image(debug_path / "hough_verified_overlay.jpg", hough_overlay)
+
+        height_, width_ = mask.shape[:2]
+        hough_real_mask = np.zeros((height_, width_), dtype=np.uint8)
+        for slot in hough_result["verified"]:
+            cx, cy = int(round(slot["center"][0])), int(round(slot["center"][1]))
+            cv2.circle(hough_real_mask, (cx, cy), radius_int, 255, -1)
+        for slot in hough_result["fallback_recovered"]:
+            cx, cy = int(round(slot["center"][0])), int(round(slot["center"][1]))
+            cv2.circle(hough_real_mask, (cx, cy), radius_int, 255, -1)
+        write_debug_image(debug_path / "hough_real_holes_mask.jpg", hough_real_mask)
+
+        with open(debug_path / "hough_verified.json", "w", encoding="utf-8") as f:
+            json.dump(hough_result, f, ensure_ascii=False, indent=2)
 
     centers_overlay = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
     # Always render orphan detections (not on any chain) in red so the
@@ -2615,6 +2836,21 @@ def analyze_curve_mode(
         metrics["grid_prior_cross_supported"] = int(sum(
             1 for c in grid_prior_candidates if c.get("cross_supported")
         ))
+
+    if hough_result is not None:
+        metrics["hough_verify_mode"] = hough_verify_mode
+        metrics["hough_param1"] = int(hough_param1)
+        metrics["hough_param2"] = int(hough_param2)
+        metrics["hough_circles_total"] = hough_result["hough_circles_total"]
+        metrics["hough_slot_positions"] = hough_result["slot_positions_total"]
+        metrics["hough_verified_real_holes"] = len(hough_result["verified"])
+        metrics["hough_fallback_recovered"] = len(hough_result["fallback_recovered"])
+        metrics["hough_true_defects"] = len(hough_result["true_defects"])
+        metrics["hough_off_grid_anomalies"] = len(hough_result["off_grid_anomalies"])
+
+    if row_lines is not None or col_lines is not None:
+        metrics["row_lines_target"] = row_lines
+        metrics["col_lines_target"] = col_lines
 
     with open(debug_path / "curve_metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
@@ -2763,6 +2999,18 @@ def parse_args():
     parser.add_argument("--filter_orphan_holes", choices=["on", "off"], default="off",
                         help="Drop detections not on any row/col chain (e.g. printed-text noise) "
                              "from the nearest-neighbour rejection set")
+    parser.add_argument("--row_lines", type=int, default=None,
+                        help="Expected number of horizontal perforation lines; "
+                             "if auto-detected chains exceed this, keep the largest N")
+    parser.add_argument("--col_lines", type=int, default=None,
+                        help="Expected number of vertical perforation lines")
+    parser.add_argument("--hough_verify", choices=["on", "off"], default="off",
+                        help="Verify lattice slot predictions with cv2.HoughCircles. "
+                             "Outputs hough_verified_overlay.jpg + hough_real_holes_mask.jpg")
+    parser.add_argument("--hough_param1", type=int, default=80,
+                        help="HoughCircles param1 (Canny upper threshold)")
+    parser.add_argument("--hough_param2", type=int, default=12,
+                        help="HoughCircles param2 (accumulator threshold; lower = more circles)")
     return parser.parse_args()
 
 
@@ -2799,6 +3047,11 @@ if __name__ == "__main__":
             scorer=args.scorer,
             grid_prior_mode=args.grid_prior,
             filter_orphan_holes_mode=args.filter_orphan_holes,
+            row_lines=args.row_lines,
+            col_lines=args.col_lines,
+            hough_verify_mode=args.hough_verify,
+            hough_param1=args.hough_param1,
+            hough_param2=args.hough_param2,
         )
     else:
         output = args.output or "result_defect.jpg"
