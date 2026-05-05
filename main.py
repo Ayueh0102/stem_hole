@@ -1121,11 +1121,13 @@ def find_expected_hole_candidates(
     scorer="area",
     gray=None,
     template=None,
+    accepted_points_for_nn=None,
 ):
     if not points or not models:
         return []
 
-    accepted_points = np.array(points, dtype=float)
+    nn_source = accepted_points_for_nn if accepted_points_for_nn is not None else points
+    accepted_points = np.array(nn_source, dtype=float) if len(nn_source) else np.array(points, dtype=float)
     height, width = mask.shape[:2]
     expected_area = float(hole_stats.get("area_median", 80.0) or 80.0)
     expected_radius = float(hole_stats.get("radius_median", 6.0) or 6.0)
@@ -1216,11 +1218,13 @@ def find_spacing_inferred_hole_candidates(
     scorer="area",
     gray=None,
     template=None,
+    accepted_points_for_nn=None,
 ):
     if not points or not models:
         return [], []
 
-    accepted_points = np.array(points, dtype=float)
+    nn_source = accepted_points_for_nn if accepted_points_for_nn is not None else points
+    accepted_points = np.array(nn_source, dtype=float) if len(nn_source) else np.array(points, dtype=float)
     height, width = mask.shape[:2]
     expected_area = float(hole_stats.get("area_median", 80.0) or 80.0)
     expected_radius = float(hole_stats.get("radius_median", 6.0) or 6.0)
@@ -1330,6 +1334,7 @@ def find_grid_prior_candidates(
     scorer="area",
     gray=None,
     template=None,
+    accepted_points_for_nn=None,
 ):
     """Predict hole positions from per-line spacing lattices, extended
     to the paper-mask boundary, and score each predicted position that
@@ -1345,7 +1350,8 @@ def find_grid_prior_candidates(
     if not points or not models:
         return [], []
 
-    accepted_points = np.array(points, dtype=float)
+    nn_source = accepted_points_for_nn if accepted_points_for_nn is not None else points
+    accepted_points = np.array(nn_source, dtype=float) if len(nn_source) else np.array(points, dtype=float)
     expected_area = float(hole_stats.get("area_median", 80.0) or 80.0)
     expected_radius = float(hole_stats.get("radius_median", 6.0) or 6.0)
     roi_radius = int(max(roi_radius, expected_radius * 2.0 + 2))
@@ -1454,11 +1460,13 @@ def find_local_gap_candidates(
     scorer="area",
     gray=None,
     template=None,
+    accepted_points_for_nn=None,
 ):
     if not points or not models:
         return [], []
 
-    accepted_points = np.array(points, dtype=float)
+    nn_source = accepted_points_for_nn if accepted_points_for_nn is not None else points
+    accepted_points = np.array(nn_source, dtype=float) if len(nn_source) else np.array(points, dtype=float)
     height, width = mask.shape[:2]
     expected_area = float(hole_stats.get("area_median", 80.0) or 80.0)
     expected_radius = float(hole_stats.get("radius_median", 6.0) or 6.0)
@@ -1628,11 +1636,13 @@ def merge_row_col_consensus_candidates(
     scorer="area",
     gray=None,
     template=None,
+    accepted_points_for_nn=None,
 ):
     if not row_candidates and not col_candidates:
         return [], []
 
-    accepted_points = np.array(points, dtype=float)
+    nn_source = accepted_points_for_nn if accepted_points_for_nn is not None else points
+    accepted_points = np.array(nn_source, dtype=float) if len(nn_source) else np.array(points, dtype=float)
     expected_area = float(hole_stats.get("area_median", 80.0) or 80.0)
     expected_radius = float(hole_stats.get("radius_median", 6.0) or 6.0)
     roi_radius = int(max(roi_radius, expected_radius * 2.0 + 2))
@@ -2071,11 +2081,13 @@ def find_secondary_origin_candidates(
     scorer="area",
     gray=None,
     template=None,
+    accepted_points_for_nn=None,
 ):
     if not mask_variants or not points:
         return []
 
-    accepted_points = np.array(points, dtype=float)
+    nn_source = accepted_points_for_nn if accepted_points_for_nn is not None else points
+    accepted_points = np.array(nn_source, dtype=float) if len(nn_source) else np.array(points, dtype=float)
     expected_area = float(hole_stats.get("area_median", 80.0) or 80.0)
     expected_radius = float(hole_stats.get("radius_median", 6.0) or 6.0)
     roi_radius = int(max(roi_radius, expected_radius * 2.0 + 2))
@@ -2153,6 +2165,7 @@ def analyze_curve_mode(
     metrics_baseline=None,
     scorer="area",
     grid_prior_mode="off",
+    filter_orphan_holes_mode="off",
 ):
     img, gray, mask = preprocess_image(
         image_path,
@@ -2195,19 +2208,30 @@ def analyze_curve_mode(
     row_models = fit_curve_models(points, row_chains, "row", degree=poly_degree)
     col_models = fit_curve_models(points, col_chains, "col", degree=poly_degree)
 
+    chain_member_indices = set()
+    for model in row_models:
+        chain_member_indices.update(model.ordered_indices)
+    for model in col_models:
+        chain_member_indices.update(model.ordered_indices)
+    chain_points = [points[idx] for idx in sorted(chain_member_indices)]
+
     if paper_mask_mode == "on":
-        # Use only chain-validated points (members of any row or col chain)
-        # for the bounding region, so noise detections in printed marginalia
-        # cannot drag the rectangle into the scanner background.
-        chain_member_indices = set()
-        for model in row_models:
-            chain_member_indices.update(model.ordered_indices)
-        for model in col_models:
-            chain_member_indices.update(model.ordered_indices)
-        chain_points = [points[idx] for idx in sorted(chain_member_indices)]
+        # Use chain-validated points only so noise detections in printed
+        # marginalia cannot drag the bounding rectangle outward.
         paper_mask = segment_paper_region(img, chain_points or points)
     else:
         paper_mask = None
+
+    # Optionally filter the accepted-points set used for nearest-neighbour
+    # rejection during candidate finding. This drops orphan detections
+    # (holes not on any row/col chain — usually printed text inside
+    # stamps that black-top-hat picks up as small dark structures), so
+    # real candidate positions near those orphans are not falsely
+    # rejected as duplicates.
+    if filter_orphan_holes_mode == "on" and chain_points:
+        accepted_points_for_nn = chain_points
+    else:
+        accepted_points_for_nn = points
 
     row_outliers = collect_curve_outliers(points, row_models)
     col_outliers = collect_curve_outliers(points, col_models)
@@ -2285,6 +2309,7 @@ def analyze_curve_mode(
         roi_radius=weak_roi_radius,
         paper_mask=paper_mask,
         scorer=scorer, gray=gray, template=hole_template,
+        accepted_points_for_nn=accepted_points_for_nn,
     )
 
     expected_hole_candidates = find_expected_hole_candidates(
@@ -2298,6 +2323,7 @@ def analyze_curve_mode(
         gap_factor=weak_gap_factor,
         paper_mask=paper_mask,
         scorer=scorer, gray=gray, template=hole_template,
+        accepted_points_for_nn=accepted_points_for_nn,
     )
     spacing_inferred_candidates, spacing_lattices = find_spacing_inferred_hole_candidates(
         mask,
@@ -2308,6 +2334,7 @@ def analyze_curve_mode(
         roi_radius=weak_roi_radius,
         paper_mask=paper_mask,
         scorer=scorer, gray=gray, template=hole_template,
+        accepted_points_for_nn=accepted_points_for_nn,
     )
     local_gap_row_candidates, local_gap_row_lines = find_local_gap_candidates(
         mask,
@@ -2320,6 +2347,7 @@ def analyze_curve_mode(
         endpoint_extend_steps=local_gap_endpoint_steps,
         paper_mask=paper_mask,
         scorer=scorer, gray=gray, template=hole_template,
+        accepted_points_for_nn=accepted_points_for_nn,
     )
     local_gap_col_candidates, local_gap_col_lines = find_local_gap_candidates(
         mask,
@@ -2332,6 +2360,7 @@ def analyze_curve_mode(
         endpoint_extend_steps=local_gap_endpoint_steps,
         paper_mask=paper_mask,
         scorer=scorer, gray=gray, template=hole_template,
+        accepted_points_for_nn=accepted_points_for_nn,
     )
     local_gap_candidates = local_gap_row_candidates + local_gap_col_candidates
     consensus_candidates, consensus_debug_only_candidates = merge_row_col_consensus_candidates(
@@ -2345,6 +2374,7 @@ def analyze_curve_mode(
         roi_radius=weak_roi_radius,
         paper_mask=paper_mask,
         scorer=scorer, gray=gray, template=hole_template,
+        accepted_points_for_nn=accepted_points_for_nn,
     )
     if grid_prior_mode == "on":
         grid_prior_candidates, grid_prior_lattices = find_grid_prior_candidates(
@@ -2441,8 +2471,13 @@ def analyze_curve_mode(
         )
 
     centers_overlay = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-    for point in points:
-        cv2.circle(centers_overlay, point, 3, (255, 255, 0), -1)
+    # Always render orphan detections (not on any chain) in red so the
+    # source of any text-induced false positives is visible at a glance.
+    orphan_indices = [i for i in range(len(points)) if i not in chain_member_indices]
+    for idx in orphan_indices:
+        cv2.circle(centers_overlay, points[idx], 3, (0, 0, 255), -1)
+    for idx in sorted(chain_member_indices):
+        cv2.circle(centers_overlay, points[idx], 3, (255, 255, 0), -1)
     write_debug_image(debug_path / "centers_overlay.jpg", centers_overlay)
 
     rows_overlay = centers_overlay.copy()
@@ -2725,6 +2760,9 @@ def parse_args():
                         help="Candidate scoring backend: area (legacy mask area) or template (NCC)")
     parser.add_argument("--grid_prior", choices=["on", "off"], default="off",
                         help="Predict hole positions from spacing lattice extended to paper boundary")
+    parser.add_argument("--filter_orphan_holes", choices=["on", "off"], default="off",
+                        help="Drop detections not on any row/col chain (e.g. printed-text noise) "
+                             "from the nearest-neighbour rejection set")
     return parser.parse_args()
 
 
@@ -2760,6 +2798,7 @@ if __name__ == "__main__":
             metrics_baseline=args.metrics_baseline,
             scorer=args.scorer,
             grid_prior_mode=args.grid_prior,
+            filter_orphan_holes_mode=args.filter_orphan_holes,
         )
     else:
         output = args.output or "result_defect.jpg"
