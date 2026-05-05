@@ -1508,13 +1508,31 @@ def find_lattice_verified_real_holes(
     hough_centers = hough[0, :, :2] if hough is not None else np.empty((0, 2), dtype=float)
 
     slot_positions = []
+    refined_lattices = []
     for model in list(row_models) + list(col_models):
         lattice = estimate_spacing_lattice(points, model)
         if lattice is None:
             continue
-        pitch = float(lattice["pitch"])
-        phase = float(lattice["phase"])
-        slot_min, slot_max = extend_lattice_to_paper(model, lattice, paper_mask, image_shape)
+        # Snap-to-slot refinement: re-fit pitch+phase using only the
+        # densely-correct middle points (residual <= pitch * 0.2).
+        # This excludes "fly-off" defective holes from biasing the fit.
+        refined = refine_lattice_with_inliers(points, model, lattice)
+        pitch = float(refined.get("refined_pitch", lattice["pitch"]))
+        phase = float(refined.get("refined_phase", lattice["phase"]))
+        refined_lattices.append({
+            "orientation": model.orientation,
+            "line_id": model.line_id,
+            "original_pitch": float(lattice["pitch"]),
+            "refined_pitch": pitch,
+            "original_phase": float(lattice["phase"]),
+            "refined_phase": phase,
+            "inlier_count": refined.get("inlier_count", 0),
+            "outlier_count": refined.get("outlier_count", 0),
+            "residual_median": refined.get("residual_median", 0.0),
+        })
+        # Re-package for extend_lattice_to_paper which expects pitch/phase keys
+        refined_lattice = {**lattice, "pitch": pitch, "phase": phase}
+        slot_min, slot_max = extend_lattice_to_paper(model, refined_lattice, paper_mask, image_shape)
         for slot in range(slot_min, slot_max + 1):
             x, y = evaluate_curve_point(model, phase + pitch * slot)
             if x < 0 or y < 0 or x >= width or y >= height:
@@ -1595,6 +1613,7 @@ def find_lattice_verified_real_holes(
         "fallback_recovered": fallback,
         "true_defects": defects,
         "off_grid_anomalies": off_grid,
+        "refined_lattices": refined_lattices,
     }
 
 
@@ -1612,6 +1631,150 @@ def enforce_chain_count(chains, target_count):
     if len(chains) <= target_count:
         return chains
     return sorted(chains, key=len, reverse=True)[:target_count]
+
+
+def cluster_with_target_count(
+    points,
+    orientation,
+    candidate_indices,
+    target_count,
+    min_line_points,
+    cluster_gap,
+    min_span=80,
+):
+    """Cluster line chains, retrying with progressively looser parameters
+    when the user-specified ``target_count`` is not yet reached.
+
+    The single-shot ``cluster_line_chains_by_axis`` can over-segment
+    (too many small chains) or under-segment (too few because the
+    densest cells fall below ``min_line_points``). enforce_chain_count
+    handles the over-segment case; this wrapper handles the under-segment
+    case by relaxing ``min_line_points`` and ``cluster_gap`` in steps,
+    stopping as soon as the chain count meets the target. Returns
+    ``(chains, attempts)`` where attempts logs each retry's parameters
+    and resulting count for diagnostic emission to curve_metrics.json.
+    """
+    attempts = []
+
+    def _try(mlp, cg):
+        chains = cluster_line_chains_by_axis(
+            points,
+            orientation,
+            min_line_points=mlp,
+            cluster_gap=cg,
+            min_span=min_span,
+            candidate_indices=candidate_indices,
+        )
+        attempts.append({
+            "min_line_points": int(mlp),
+            "cluster_gap": float(cg),
+            "chain_count": len(chains),
+        })
+        return chains
+
+    chains = _try(min_line_points, cluster_gap)
+
+    if target_count is None or target_count <= 0:
+        return chains, attempts
+    if len(chains) >= target_count:
+        return enforce_chain_count(chains, target_count), attempts
+
+    # Under-segmented: relax min_line_points first (cheaper), then cluster_gap.
+    relaxed_min = [
+        max(3, int(min_line_points * 0.75)),
+        max(3, int(min_line_points * 0.5)),
+        max(3, int(min_line_points * 0.3)),
+    ]
+    for mlp in relaxed_min:
+        if mlp >= min_line_points:
+            continue
+        chains = _try(mlp, cluster_gap)
+        if len(chains) >= target_count:
+            return enforce_chain_count(chains, target_count), attempts
+
+    # Still short — try widening cluster_gap with the most relaxed min_line_points
+    relaxed_gap = [cluster_gap * 1.5, cluster_gap * 2.0]
+    final_min = max(3, int(min_line_points * 0.3))
+    for cg in relaxed_gap:
+        chains = _try(final_min, cg)
+        if len(chains) >= target_count:
+            return enforce_chain_count(chains, target_count), attempts
+
+    # Give up and return the best-effort result
+    return chains, attempts
+
+
+def refine_lattice_with_inliers(points, model, lattice, residual_factor=0.2):
+    """Refine a spacing lattice by snap-to-slot then re-fit on inliers.
+
+    The user's domain insight (paraphrased): middle points have fixed
+    spacing, only a few "fly off". The original ``estimate_spacing_lattice``
+    uses median + np.polyfit on every chain point, so any flying-off
+    outlier still pulls the fitted pitch slightly. This refinement does:
+
+      1. Snap each chain point to the nearest slot using the initial
+         (pitch, phase) from lattice.
+      2. Compute residual for each point.
+      3. Mark inliers as those with |residual| <= pitch * residual_factor.
+      4. Re-fit pitch and phase using only inliers (np.polyfit).
+      5. Recompute residuals against refined fit.
+
+    Returns the lattice dict augmented with ``refined_pitch``,
+    ``refined_phase``, ``inlier_count``, ``outlier_count``,
+    ``residual_median`` (refined). When refinement fails (too few
+    inliers, degenerate fit) the returned dict falls back to the
+    original lattice values.
+    """
+    parameters = np.array(
+        [curve_parameter_for_point(model, points[idx]) for idx in model.ordered_indices],
+        dtype=float,
+    )
+    parameters.sort()
+    pitch = float(lattice.get("pitch", 0.0))
+    phase = float(lattice.get("phase", 0.0))
+
+    if pitch <= 0 or len(parameters) < 3:
+        return {**lattice, "refined_pitch": pitch, "refined_phase": phase,
+                "inlier_count": int(len(parameters)), "outlier_count": 0,
+                "residual_median": 0.0}
+
+    slots = np.round((parameters - phase) / pitch).astype(float)
+    residuals = parameters - (phase + slots * pitch)
+    tolerance = pitch * residual_factor
+    inlier_mask = np.abs(residuals) <= tolerance
+
+    if int(np.sum(inlier_mask)) < 3:
+        return {**lattice, "refined_pitch": pitch, "refined_phase": phase,
+                "inlier_count": int(len(parameters)), "outlier_count": 0,
+                "residual_median": float(np.median(np.abs(residuals)))}
+
+    inlier_slots = slots[inlier_mask]
+    inlier_params = parameters[inlier_mask]
+    try:
+        refined_pitch, refined_phase = np.polyfit(inlier_slots, inlier_params, 1)
+    except np.linalg.LinAlgError:
+        return {**lattice, "refined_pitch": pitch, "refined_phase": phase,
+                "inlier_count": int(np.sum(inlier_mask)),
+                "outlier_count": int(np.sum(~inlier_mask)),
+                "residual_median": float(np.median(np.abs(residuals)))}
+
+    if refined_pitch <= 0:
+        return {**lattice, "refined_pitch": pitch, "refined_phase": phase,
+                "inlier_count": int(np.sum(inlier_mask)),
+                "outlier_count": int(np.sum(~inlier_mask)),
+                "residual_median": float(np.median(np.abs(residuals)))}
+
+    final_residuals = parameters - (refined_phase + slots * refined_pitch)
+    final_inlier_mask = np.abs(final_residuals) <= tolerance
+
+    return {
+        **lattice,
+        "refined_pitch": float(refined_pitch),
+        "refined_phase": float(refined_phase),
+        "inlier_count": int(np.sum(final_inlier_mask)),
+        "outlier_count": int(np.sum(~final_inlier_mask)),
+        "residual_median": float(np.median(np.abs(final_residuals))),
+    }
 
 
 def find_local_gap_candidates(
@@ -2365,22 +2528,34 @@ def analyze_curve_mode(
         col_edges,
         vote_margin=line_direction_vote_margin,
     )
-    row_chains = cluster_line_chains_by_axis(
-        points,
-        "row",
-        min_line_points=min_line_points,
-        cluster_gap=line_cluster_gap,
-        candidate_indices=row_point_indices,
-    )
-    col_chains = cluster_line_chains_by_axis(
-        points,
-        "col",
-        min_line_points=min_line_points,
-        cluster_gap=line_cluster_gap,
-        candidate_indices=col_point_indices,
-    )
-    row_chains = enforce_chain_count(row_chains, row_lines)
-    col_chains = enforce_chain_count(col_chains, col_lines)
+    if row_lines is not None or col_lines is not None:
+        row_chains, row_chain_attempts = cluster_with_target_count(
+            points, "row", row_point_indices,
+            target_count=row_lines,
+            min_line_points=min_line_points,
+            cluster_gap=line_cluster_gap,
+        )
+        col_chains, col_chain_attempts = cluster_with_target_count(
+            points, "col", col_point_indices,
+            target_count=col_lines,
+            min_line_points=min_line_points,
+            cluster_gap=line_cluster_gap,
+        )
+    else:
+        row_chains = cluster_line_chains_by_axis(
+            points, "row",
+            min_line_points=min_line_points,
+            cluster_gap=line_cluster_gap,
+            candidate_indices=row_point_indices,
+        )
+        col_chains = cluster_line_chains_by_axis(
+            points, "col",
+            min_line_points=min_line_points,
+            cluster_gap=line_cluster_gap,
+            candidate_indices=col_point_indices,
+        )
+        row_chain_attempts = []
+        col_chain_attempts = []
     row_models = fit_curve_models(points, row_chains, "row", degree=poly_degree)
     col_models = fit_curve_models(points, col_chains, "col", degree=poly_degree)
 
@@ -2847,10 +3022,22 @@ def analyze_curve_mode(
         metrics["hough_fallback_recovered"] = len(hough_result["fallback_recovered"])
         metrics["hough_true_defects"] = len(hough_result["true_defects"])
         metrics["hough_off_grid_anomalies"] = len(hough_result["off_grid_anomalies"])
+        refined = hough_result.get("refined_lattices", [])
+        if refined:
+            metrics["lattice_refine_total_inliers"] = int(sum(l.get("inlier_count", 0) for l in refined))
+            metrics["lattice_refine_total_outliers"] = int(sum(l.get("outlier_count", 0) for l in refined))
+            pitch_shifts = [
+                abs(l.get("refined_pitch", 0) - l.get("original_pitch", 0))
+                for l in refined
+            ]
+            metrics["lattice_refine_pitch_shift_max"] = float(max(pitch_shifts)) if pitch_shifts else 0.0
+            metrics["lattice_refine_pitch_shift_median"] = float(np.median(pitch_shifts)) if pitch_shifts else 0.0
 
     if row_lines is not None or col_lines is not None:
         metrics["row_lines_target"] = row_lines
         metrics["col_lines_target"] = col_lines
+        metrics["row_chain_attempts"] = row_chain_attempts
+        metrics["col_chain_attempts"] = col_chain_attempts
 
     with open(debug_path / "curve_metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
