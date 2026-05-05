@@ -78,33 +78,35 @@ def preprocess_image(
     return img, gray, mask
 
 
-def segment_paper_region(image, points, padding_pixels=40):
-    """Estimate the stamp-sheet area as the dilated convex hull of
-    detected hole centres.
+def segment_paper_region(image, points, padding_pixels=20):
+    """Estimate the stamp-sheet area as the minimum-area rotated bounding
+    rectangle of detected hole centres.
 
-    Intensity-based segmentation (Otsu on blurred grayscale) is brittle
-    here because the stamp sheet contains a mix of dark ink, paper-colour
-    holes, and a thin printed frame line; both the hole grid and the
-    scanner backing can produce confusing thresholds. The detected hole
-    centres are already a strong signal: they trace the perforation grid,
-    which by definition sits inside the sheet. The convex hull of those
-    centres bounds the hole grid; padding outward by half-a-pitch worth
-    of pixels gives a generous boundary that still excludes the scanner
-    background and any printed marks outside the perforated area.
+    Earlier versions used ``cv2.convexHull``, but a single outlier hole
+    (e.g. a stray detection in printed marginalia) drags the hull into
+    a "tent" shape that extends well beyond the actual sheet — the
+    grid_prior strategy then over-extends past the paper. ``minAreaRect``
+    is robust to a small number of outliers because it computes the
+    smallest rotated rectangle enclosing all points: a single outlier
+    can stretch one side but cannot create a corner peak. The padding
+    keeps a small slack for boundary holes that genuinely lie just
+    outside the rectangle of detected centres.
 
     Returns a uint8 mask (255 inside paper, 0 outside). When too few
-    points are available to form a hull, returns a fully-True mask so the
-    caller can treat ``paper_mask`` as a no-op.
+    points are available, returns a fully-True mask so the caller can
+    treat ``paper_mask`` as a no-op.
     """
     height, width = image.shape[:2]
     if len(points) < 3:
         return np.full((height, width), 255, dtype=np.uint8)
 
-    pts = np.array(points, dtype=np.int32).reshape(-1, 1, 2)
-    hull = cv2.convexHull(pts)
+    pts = np.array(points, dtype=np.float32).reshape(-1, 1, 2)
+    rect = cv2.minAreaRect(pts)
+    box = cv2.boxPoints(rect)
+    box_int = np.round(box).astype(np.int32)
 
     mask = np.zeros((height, width), dtype=np.uint8)
-    cv2.fillConvexPoly(mask, hull, 255)
+    cv2.fillConvexPoly(mask, box_int, 255)
 
     if padding_pixels > 0:
         kernel_size = max(3, padding_pixels * 2 + 1)
@@ -2106,7 +2108,6 @@ def analyze_curve_mode(
     holes = detect_hole_centers(mask)
     points = hole_points(holes)
     hole_stats = compute_hole_statistics(holes)
-    paper_mask = segment_paper_region(img, points) if paper_mask_mode == "on" else None
     if scorer == "template":
         template_radius = float(hole_stats.get("radius_median", 6.0) or 6.0)
         hole_template = build_hole_template(template_radius)
@@ -2136,6 +2137,20 @@ def analyze_curve_mode(
     )
     row_models = fit_curve_models(points, row_chains, "row", degree=poly_degree)
     col_models = fit_curve_models(points, col_chains, "col", degree=poly_degree)
+
+    if paper_mask_mode == "on":
+        # Use only chain-validated points (members of any row or col chain)
+        # for the bounding region, so noise detections in printed marginalia
+        # cannot drag the rectangle into the scanner background.
+        chain_member_indices = set()
+        for model in row_models:
+            chain_member_indices.update(model.ordered_indices)
+        for model in col_models:
+            chain_member_indices.update(model.ordered_indices)
+        chain_points = [points[idx] for idx in sorted(chain_member_indices)]
+        paper_mask = segment_paper_region(img, chain_points or points)
+    else:
+        paper_mask = None
 
     row_outliers = collect_curve_outliers(points, row_models)
     col_outliers = collect_curve_outliers(points, col_models)
