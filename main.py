@@ -1250,6 +1250,140 @@ def find_spacing_inferred_hole_candidates(
 
     return deduplicate_candidates(candidates, merge_radius=match_radius), lattices
 
+
+def extend_lattice_to_paper(
+    model,
+    lattice,
+    paper_mask,
+    image_shape,
+    max_extension_steps=120,
+):
+    """Walk outward from a lattice's observed slot range until the
+    predicted position leaves the paper_mask (or the image bounds, when
+    paper_mask is None). Returns ``(slot_min_extended, slot_max_extended)``.
+
+    Used by the grid-prior strategy to predict hole positions BEYOND the
+    detected hull. The walk stops the moment a lattice position falls
+    outside the paper, so corner clipping is automatic.
+    """
+    height, width = image_shape[:2]
+    pitch = lattice["pitch"]
+    phase = lattice["phase"]
+    slot_min = lattice["slot_min"]
+    slot_max = lattice["slot_max"]
+
+    def _on_paper(slot):
+        x, y = evaluate_curve_point(model, phase + pitch * slot)
+        if x < 0 or y < 0 or x >= width or y >= height:
+            return False
+        return is_inside_paper(paper_mask, x, y)
+
+    # extend left
+    extended_min = slot_min
+    for _ in range(max_extension_steps):
+        if not _on_paper(extended_min - 1):
+            break
+        extended_min -= 1
+    # extend right
+    extended_max = slot_max
+    for _ in range(max_extension_steps):
+        if not _on_paper(extended_max + 1):
+            break
+        extended_max += 1
+
+    return extended_min, extended_max
+
+
+def find_grid_prior_candidates(
+    mask,
+    points,
+    models,
+    hole_stats,
+    paper_mask,
+    image_shape,
+    match_radius=8.0,
+    roi_radius=14,
+    scorer="area",
+    gray=None,
+    template=None,
+):
+    """Predict hole positions from per-line spacing lattices, extended
+    to the paper-mask boundary, and score each predicted position that
+    has no nearby detected hole.
+
+    This is the Phase 2D "prior-driven" strategy: instead of inferring
+    candidates from gaps between detected holes (which can only fill
+    interior misses), the lattice is treated as ground truth and every
+    expected hole position is scored. Off-paper predictions are clipped
+    by paper_mask, so the lattice never extrapolates into the scanner
+    background.
+    """
+    if not points or not models:
+        return [], []
+
+    accepted_points = np.array(points, dtype=float)
+    expected_area = float(hole_stats.get("area_median", 80.0) or 80.0)
+    expected_radius = float(hole_stats.get("radius_median", 6.0) or 6.0)
+    roi_radius = int(max(roi_radius, expected_radius * 2.0 + 2))
+    height, width = image_shape[:2]
+
+    candidates = []
+    lattices = []
+    for model in models:
+        lattice = estimate_spacing_lattice(points, model)
+        if lattice is None:
+            continue
+
+        slot_min_ext, slot_max_ext = extend_lattice_to_paper(
+            model, lattice, paper_mask, image_shape,
+        )
+        lattice_record = {
+            "orientation": model.orientation,
+            "line_id": model.line_id,
+            **lattice,
+            "slot_min_extended": int(slot_min_ext),
+            "slot_max_extended": int(slot_max_ext),
+            "extension_count": int(
+                (lattice["slot_min"] - slot_min_ext) + (slot_max_ext - lattice["slot_max"])
+            ),
+        }
+        lattices.append(lattice_record)
+
+        pitch = lattice["pitch"]
+        phase = lattice["phase"]
+        for slot in range(slot_min_ext, slot_max_ext + 1):
+            parameter = phase + pitch * slot
+            x, y = evaluate_curve_point(model, parameter)
+            if x < 0 or y < 0 or x >= width or y >= height:
+                continue
+            if not is_inside_paper(paper_mask, x, y):
+                continue
+
+            score, nearest_distance = evaluate_candidate_position(
+                mask, x, y, accepted_points, match_radius,
+                expected_area, expected_radius, roi_radius,
+                scorer=scorer, gray=gray, template=template,
+            )
+            if score is None:
+                continue
+
+            candidates.append(
+                {
+                    "center": [float(x), float(y)],
+                    "parameter": float(parameter),
+                    "pitch": float(pitch),
+                    "slot": int(slot),
+                    "source": "grid_prior",
+                    "orientation": model.orientation,
+                    "line_id": model.line_id,
+                    "nearest_detected_distance": nearest_distance,
+                    **score,
+                }
+            )
+
+    return deduplicate_candidates(candidates, merge_radius=match_radius), lattices
+
+
 def find_local_gap_candidates(
     mask,
     points,
@@ -1722,6 +1856,13 @@ STRATEGY_ARTIFACT_PATHS = {
         "repaired_mask": "secondary_origin_repaired_circles_mask.jpg",
         "json": "secondary_origin_candidates.json",
     },
+    "grid_prior": {
+        "overlay": "grid_prior_candidates_overlay.jpg",
+        "crops": "grid_prior_candidate_crops.jpg",
+        "repaired_overlay": "grid_prior_repaired_circles_overlay.jpg",
+        "repaired_mask": "grid_prior_repaired_circles_mask.jpg",
+        "json": "grid_prior_candidates.json",
+    },
 }
 
 
@@ -1954,6 +2095,7 @@ def analyze_curve_mode(
     adaptive_c=5,
     metrics_baseline=None,
     scorer="area",
+    grid_prior_mode="off",
 ):
     img, gray, mask = preprocess_image(
         image_path,
@@ -2130,6 +2272,20 @@ def analyze_curve_mode(
         paper_mask=paper_mask,
         scorer=scorer, gray=gray, template=hole_template,
     )
+    if grid_prior_mode == "on":
+        grid_prior_candidates, grid_prior_lattices = find_grid_prior_candidates(
+            mask,
+            points,
+            row_models + col_models,
+            hole_stats,
+            paper_mask,
+            mask.shape,
+            match_radius=weak_match_radius,
+            roi_radius=weak_roi_radius,
+            scorer=scorer, gray=gray, template=hole_template,
+        )
+    else:
+        grid_prior_candidates, grid_prior_lattices = [], []
     weak_candidate_counts = {
         "WEAK": sum(1 for candidate in expected_hole_candidates if candidate["class"] == "WEAK"),
         "BROKEN": sum(1 for candidate in expected_hole_candidates if candidate["class"] == "BROKEN"),
@@ -2198,6 +2354,16 @@ def analyze_curve_mode(
             "candidates": secondary_origin_candidates,
         },
     )
+
+    if grid_prior_mode == "on":
+        emit_strategy_artifacts(
+            "grid_prior", mask, holes, points,
+            grid_prior_candidates, expected_radius, debug_path,
+            json_payload={
+                "lattices": grid_prior_lattices,
+                "candidates": grid_prior_candidates,
+            },
+        )
 
     centers_overlay = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
     for point in points:
@@ -2324,6 +2490,14 @@ def analyze_curve_mode(
         metrics["scorer"] = scorer
         if hole_template is not None:
             metrics["template_size"] = int(hole_template.shape[0])
+
+    if grid_prior_mode == "on":
+        metrics["grid_prior_mode"] = grid_prior_mode
+        metrics["grid_prior_candidates"] = len(grid_prior_candidates)
+        metrics["grid_prior_candidate_counts"] = count_candidates_by_class(grid_prior_candidates)
+        metrics["grid_prior_extension_total"] = int(sum(
+            l.get("extension_count", 0) for l in grid_prior_lattices
+        ))
 
     with open(debug_path / "curve_metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
@@ -2459,6 +2633,8 @@ def parse_args():
                         help="Path to baseline curve_metrics.json for regression diff")
     parser.add_argument("--scorer", choices=["area", "template"], default="area",
                         help="Candidate scoring backend: area (legacy mask area) or template (NCC)")
+    parser.add_argument("--grid_prior", choices=["on", "off"], default="off",
+                        help="Predict hole positions from spacing lattice extended to paper boundary")
     return parser.parse_args()
 
 
@@ -2491,6 +2667,7 @@ if __name__ == "__main__":
             adaptive_c=args.adaptive_c,
             metrics_baseline=args.metrics_baseline,
             scorer=args.scorer,
+            grid_prior_mode=args.grid_prior,
         )
     else:
         output = args.output or "result_defect.jpg"
