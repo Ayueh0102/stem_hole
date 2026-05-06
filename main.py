@@ -1445,6 +1445,53 @@ def annotate_grid_prior_consensus(candidates):
     return annotated
 
 
+def filter_points_by_band_mask(points, holes, row_models, col_models,
+                                  image_shape, band_expand_pixels=12,
+                                  paper_mask=None):
+    """Build a perforation-band mask from fitted row/col curves and keep
+    only the points (and matching holes) that fall inside the band.
+
+    The user's domain insight: every real hole sits ON one of the
+    perforation lines (row or col), so anything outside a thin strip
+    centred on those lines is by definition NOT a perforation.
+    Building the band mask requires curves to be already fitted from
+    a first detection pass, so this is meant for a second-pass clean
+    up: detect → fit → mask interior → re-filter.
+
+    ``band_expand_pixels`` is the half-width of the strip in pixels;
+    set it just larger than the hole radius so even slightly off-line
+    detections survive (camera distortion, sub-pixel jitter), while
+    text strokes inside stamp interiors are excluded.
+
+    Returns ``(filtered_points, filtered_holes, kept_indices, band_mask)``.
+    The kept_indices map back into the original ``points`` list so
+    callers can keep references stable.
+    """
+    height, width = image_shape[:2]
+    # Build row + col band mask using the existing helper.
+    row_band = build_curve_band_mask(
+        image_shape, row_models,
+        expand_pixels=band_expand_pixels, extend_pixels=0,
+    )
+    col_band = build_curve_band_mask(
+        image_shape, col_models,
+        expand_pixels=band_expand_pixels, extend_pixels=0,
+    )
+    band_mask = cv2.bitwise_or(row_band, col_band)
+    if paper_mask is not None:
+        band_mask = cv2.bitwise_and(band_mask, paper_mask)
+
+    kept_indices = []
+    for idx, p in enumerate(points):
+        x, y = int(round(p[0])), int(round(p[1]))
+        if 0 <= x < width and 0 <= y < height and band_mask[y, x]:
+            kept_indices.append(idx)
+
+    filtered_points = [points[i] for i in kept_indices]
+    filtered_holes = [holes[i] for i in kept_indices]
+    return filtered_points, filtered_holes, kept_indices, band_mask
+
+
 def find_lattice_verified_real_holes(
     image,
     points,
@@ -2503,6 +2550,8 @@ def analyze_curve_mode(
     hough_verify_mode="off",
     hough_param1=80,
     hough_param2=12,
+    mask_stamp_interior_mode="off",
+    band_expand_pixels=12,
 ):
     img, gray, mask = preprocess_image(
         image_path,
@@ -2558,6 +2607,58 @@ def analyze_curve_mode(
         col_chain_attempts = []
     row_models = fit_curve_models(points, row_chains, "row", degree=poly_degree)
     col_models = fit_curve_models(points, col_chains, "col", degree=poly_degree)
+
+    # Optional second pass: build a thin perforation-band mask from the
+    # first-pass curves and drop every detected point that falls outside
+    # the band. Stamp-interior content (illustrations, captions) cannot
+    # sit on a perforation strip by definition, so this filter cleans
+    # the point set without re-running expensive detection.
+    band_filter_stats = None
+    if mask_stamp_interior_mode == "on" and row_models and col_models:
+        before_count = len(points)
+        filtered_points, filtered_holes, kept_indices, band_mask_img = filter_points_by_band_mask(
+            points, holes, row_models, col_models, mask.shape,
+            band_expand_pixels=band_expand_pixels,
+        )
+        if len(filtered_points) >= max(50, len(row_models) + len(col_models)):
+            points = filtered_points
+            holes = filtered_holes
+            # Refit curves on the cleaner point set so chains/lattices
+            # downstream aren't anchored to noise positions.
+            edges = build_candidate_edges(points, min_dist=15, max_dist=dist_threshold)
+            row_edges, col_edges = classify_edges_by_orientation(edges)
+            row_point_indices, col_point_indices = directional_point_indices_from_edges(
+                row_edges, col_edges, vote_margin=line_direction_vote_margin,
+            )
+            if row_lines is not None or col_lines is not None:
+                row_chains, _ = cluster_with_target_count(
+                    points, "row", row_point_indices,
+                    target_count=row_lines,
+                    min_line_points=min_line_points, cluster_gap=line_cluster_gap,
+                )
+                col_chains, _ = cluster_with_target_count(
+                    points, "col", col_point_indices,
+                    target_count=col_lines,
+                    min_line_points=min_line_points, cluster_gap=line_cluster_gap,
+                )
+            else:
+                row_chains = cluster_line_chains_by_axis(
+                    points, "row", min_line_points=min_line_points,
+                    cluster_gap=line_cluster_gap, candidate_indices=row_point_indices,
+                )
+                col_chains = cluster_line_chains_by_axis(
+                    points, "col", min_line_points=min_line_points,
+                    cluster_gap=line_cluster_gap, candidate_indices=col_point_indices,
+                )
+            row_models = fit_curve_models(points, row_chains, "row", degree=poly_degree)
+            col_models = fit_curve_models(points, col_chains, "col", degree=poly_degree)
+            hole_stats = compute_hole_statistics(holes)
+            band_filter_stats = {
+                "before_count": int(before_count),
+                "after_count": int(len(points)),
+                "dropped": int(before_count - len(points)),
+                "band_expand_pixels": int(band_expand_pixels),
+            }
 
     chain_member_indices = set()
     for model in row_models:
@@ -2617,6 +2718,9 @@ def analyze_curve_mode(
         paper_overlay = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
         paper_overlay[paper_mask == 0] = (0, 0, 200)
         write_debug_image(debug_path / "paper_mask_overlay.jpg", paper_overlay)
+
+    if band_filter_stats is not None:
+        write_debug_image(debug_path / "perforation_band_mask.jpg", band_mask_img)
 
     if threshold_mode == "adaptive":
         write_debug_image(debug_path / "adaptive_mask.jpg", mask)
@@ -3039,6 +3143,10 @@ def analyze_curve_mode(
         metrics["row_chain_attempts"] = row_chain_attempts
         metrics["col_chain_attempts"] = col_chain_attempts
 
+    if band_filter_stats is not None:
+        metrics["mask_stamp_interior_mode"] = mask_stamp_interior_mode
+        metrics["band_filter"] = band_filter_stats
+
     with open(debug_path / "curve_metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
 
@@ -3198,6 +3306,11 @@ def parse_args():
                         help="HoughCircles param1 (Canny upper threshold)")
     parser.add_argument("--hough_param2", type=int, default=12,
                         help="HoughCircles param2 (accumulator threshold; lower = more circles)")
+    parser.add_argument("--mask_stamp_interior", choices=["on", "off"], default="off",
+                        help="Two-pass detection: build perforation-band mask from first-pass curves, "
+                             "drop points outside the band (stamp interiors / illustrations)")
+    parser.add_argument("--band_expand_pixels", type=int, default=12,
+                        help="Half-width of the perforation strip in pixels")
     return parser.parse_args()
 
 
@@ -3239,6 +3352,8 @@ if __name__ == "__main__":
             hough_verify_mode=args.hough_verify,
             hough_param1=args.hough_param1,
             hough_param2=args.hough_param2,
+            mask_stamp_interior_mode=args.mask_stamp_interior,
+            band_expand_pixels=args.band_expand_pixels,
         )
     else:
         output = args.output or "result_defect.jpg"
